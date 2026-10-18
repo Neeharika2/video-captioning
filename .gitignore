@@ -25,8 +25,9 @@
 *.pem
 *.log
 
-# env files (can opt-in for committing if needed)
-.env*
+# env files (never commit secrets; .env.example is safe)
+.env
+.env.*
 !.env.example
 
 # vercel
