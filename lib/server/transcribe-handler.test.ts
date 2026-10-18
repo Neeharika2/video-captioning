@@ -149,4 +149,22 @@ describe("handleTranscribe", () => {
     expect(res.status).toBe(status);
     expect(res.body).toMatchObject({ code, retryable });
   });
+
+  it("reports an exhausted Gemini daily limit instead of hanging", async () => {
+    const res = await call(request(ogg5s), {
+      transcribe: async () => {
+        throw new GeminiError(
+          "Gemini 429: Rate limit exceeded (limit: 25 requests per day on Free Tier).",
+          429,
+          true,
+          undefined,
+          35084,
+        );
+      },
+    });
+    expect(res.status).toBe(429);
+    expect(res.body).toMatchObject({ code: "quota_exceeded", retryable: false, retryAfterSec: 35084 });
+    expect(res.body.error).toMatch(/free tier/i);
+    expect(res.headers.get("retry-after")).toBe("35084");
+  });
 });

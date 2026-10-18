@@ -59,10 +59,45 @@ export class GeminiError extends Error {
     readonly status?: number,
     readonly retryable = false,
     readonly body?: unknown,
+    /** Seconds the API asked us to wait (Retry-After), if it sent one. */
+    readonly retryAfterSec?: number,
   ) {
     super(message);
     this.name = "GeminiError";
   }
+}
+
+/**
+ * Longest Retry-After we honour inside one request. Daily quota errors ask for
+ * hours (e.g. free tier: "retry in 9h44m"); waiting would keep the browser
+ * stuck on "Transcribing…" until its own timeout. Fail fast with the reason.
+ */
+export const MAX_RETRY_DELAY_MS = 30_000;
+
+/** Retry-After is either delta-seconds or an HTTP date. */
+export function parseRetryAfter(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds > 0) return seconds;
+  const date = Date.parse(value);
+  if (Number.isFinite(date)) return Math.max(0, Math.ceil((date - Date.now()) / 1000));
+  return undefined;
+}
+
+/** "45s", "9m 12s", "9h 44m" — for logs and error messages. */
+export function formatWait(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+/** Log an upstream failure in a form that is easy to spot in `pnpm dev`. */
+export function logUpstreamFailure(status: number | undefined, message: string, retryAfterSec?: number) {
+  const text = message.length > 500 ? `${message.slice(0, 500)}…` : message;
+  const wait = retryAfterSec !== undefined ? ` (retry after ${formatWait(retryAfterSec)})` : "";
+  console.warn(`[gemini] request failed: ${status ?? "network"} — ${text}${wait}`);
 }
 
 export function buildTranscriptionBody(
@@ -208,10 +243,11 @@ export async function transcribe(req: TranscribeRequest): Promise<TranscribeResu
       if (timeout.aborted) throw new GeminiError("Gemini request timed out", undefined, true);
       if (req.signal?.aborted) throw err;
       // Network error: retry.
+      console.warn(`[gemini] network error (attempt ${attempt}/${maxAttempts}): ${(err as Error).message}`);
       if (attempt >= maxAttempts) {
         throw new GeminiError(`Network error: ${(err as Error).message}`, undefined, true);
       }
-      await sleep(backoffMs(attempt));
+      await sleep(backoffMs(attempt), req.signal);
       continue;
     }
 
@@ -224,11 +260,16 @@ export async function transcribe(req: TranscribeRequest): Promise<TranscribeResu
     const message =
       (errBody as { error?: { message?: string } } | undefined)?.error?.message ?? res.statusText;
     const retryable = RETRYABLE_STATUS.has(res.status);
-    if (!retryable || attempt >= maxAttempts) {
-      throw new GeminiError(`Gemini ${res.status}: ${message}`, res.status, retryable, errBody);
+    const retryAfterSec = parseRetryAfter(res.headers.get("retry-after"));
+    logUpstreamFailure(res.status, message, retryAfterSec);
+    const waitMs = retryAfterSec !== undefined ? retryAfterSec * 1000 : backoffMs(attempt);
+    if (!retryable || attempt >= maxAttempts || waitMs > MAX_RETRY_DELAY_MS) {
+      throw new GeminiError(`Gemini ${res.status}: ${message}`, res.status, retryable, errBody, retryAfterSec);
     }
-    const retryAfter = Number(res.headers.get("retry-after"));
-    await sleep(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : backoffMs(attempt));
+    console.warn(
+      `[gemini] retrying in ${formatWait(waitMs / 1000)} (attempt ${attempt + 1}/${maxAttempts})`,
+    );
+    await sleep(waitMs, req.signal);
   }
 }
 
@@ -236,6 +277,21 @@ export function backoffMs(attempt: number) {
   return 1000 * 2 ** (attempt - 1) * (0.75 + Math.random() * 0.5);
 }
 
-export function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
+export function sleep(ms: number, signal?: AbortSignal) {
+  if (!signal) return new Promise<void>((r) => setTimeout(r, ms));
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason ?? new Error("Aborted"));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error("Aborted"));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }

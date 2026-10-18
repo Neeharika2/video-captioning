@@ -3,7 +3,16 @@
  * Server/benchmark only: takes the API key as an argument, never reads env.
  */
 import { z } from "zod";
-import { backoffMs, GeminiError, RETRYABLE_STATUS, sleep } from "./gemini";
+import {
+  backoffMs,
+  formatWait,
+  GeminiError,
+  logUpstreamFailure,
+  MAX_RETRY_DELAY_MS,
+  parseRetryAfter,
+  RETRYABLE_STATUS,
+  sleep,
+} from "./gemini";
 
 export const GENERATE_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
 /** Fast and cheap; matched gemini-3.8-flash on spelling in our tests. */
@@ -80,7 +89,8 @@ export async function generateJson(req: GenerateJsonRequest): Promise<GenerateJs
       if (timeout.aborted) throw new GeminiError("Gemini request timed out", undefined, true);
       if (req.signal?.aborted) throw err;
       if (attempt >= maxAttempts) throw new GeminiError(`Network error: ${(err as Error).message}`, undefined, true);
-      await sleep(backoffMs(attempt));
+      console.warn(`[gemini-text] network error (attempt ${attempt}/${maxAttempts}): ${(err as Error).message}`);
+      await sleep(backoffMs(attempt), req.signal);
       continue;
     }
 
@@ -115,10 +125,13 @@ export async function generateJson(req: GenerateJsonRequest): Promise<GenerateJs
     const errBody = await res.json().catch(() => undefined);
     const message = (errBody as { error?: { message?: string } } | undefined)?.error?.message ?? res.statusText;
     const retryable = RETRYABLE_STATUS.has(res.status);
-    if (!retryable || attempt >= maxAttempts) {
-      throw new GeminiError(`Gemini ${res.status}: ${message}`, res.status, retryable, errBody);
+    const retryAfterSec = parseRetryAfter(res.headers.get("retry-after"));
+    logUpstreamFailure(res.status, message, retryAfterSec);
+    const waitMs = retryAfterSec !== undefined ? retryAfterSec * 1000 : backoffMs(attempt);
+    if (!retryable || attempt >= maxAttempts || waitMs > MAX_RETRY_DELAY_MS) {
+      throw new GeminiError(`Gemini ${res.status}: ${message}`, res.status, retryable, errBody, retryAfterSec);
     }
-    const retryAfter = Number(res.headers.get("retry-after"));
-    await sleep(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : backoffMs(attempt));
+    console.warn(`[gemini-text] retrying in ${formatWait(waitMs / 1000)} (attempt ${attempt + 1}/${maxAttempts})`);
+    await sleep(waitMs, req.signal);
   }
 }

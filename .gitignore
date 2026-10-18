@@ -40,6 +40,8 @@ next-env.d.ts
 # local planning notes
 PLAN.md
 PLAN.v2.md
+PLAN.v3.md
+PLAN.v4.md
 
 # benchmark: private audio, cache and raw results
 /benchmark/.cache/

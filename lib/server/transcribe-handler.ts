@@ -6,7 +6,7 @@ import {
   type ApiErrorCode,
   type TranscribeResponse,
 } from "../api-types";
-import { GeminiError, transcribe as geminiTranscribe } from "../gemini";
+import { GeminiError, formatWait, transcribe as geminiTranscribe } from "../gemini";
 import { OggOpusError, oggOpusDuration } from "../ogg-duration";
 import { getConfig, type ServerConfig } from "./config";
 import { getQuotaStore, type QuotaStore } from "./quota";
@@ -77,6 +77,14 @@ export async function handleTranscribe(request: Request, deps: HandlerDeps = {})
   const quota = deps.quota ?? getQuotaStore(config);
   const decision = await quota.reserve(QUOTA_SUBJECT, durationSec);
   if (!decision.ok) {
+    log({
+      durationSec,
+      status: 429,
+      error: decision.reason,
+      usedSeconds: decision.usedSeconds,
+      limitSeconds: decision.limitSeconds,
+      retryAfterSec: decision.retryAfterSec,
+    });
     return fail(
       429,
       decision.reason,
@@ -112,19 +120,42 @@ export async function handleTranscribe(request: Request, deps: HandlerDeps = {})
     return Response.json(body);
   } catch (err) {
     await quota.refund(QUOTA_SUBJECT, durationSec).catch(() => {});
-    const res = mapUpstreamError(err);
-    log({ durationSec, status: res.status, ms: Date.now() - started, error: (err as Error).message });
+    const res = mapUpstreamError(err, config);
+    log({
+      durationSec,
+      status: res.status,
+      ms: Date.now() - started,
+      upstreamStatus: err instanceof GeminiError ? err.status : undefined,
+      retryAfterSec: err instanceof GeminiError ? err.retryAfterSec : undefined,
+      error: (err as Error).message,
+    });
     return res;
   }
 }
 
-function mapUpstreamError(err: unknown): Response {
+function mapUpstreamError(err: unknown, config: ServerConfig): Response {
   if (!(err instanceof GeminiError)) {
     if ((err as Error)?.name === "AbortError") return fail(499, "timeout", "Request aborted by client", true);
     return fail(502, "upstream", "Transcription failed unexpectedly", true);
   }
   if (err.message.includes("timed out")) return fail(504, "timeout", "Transcription timed out; try a shorter chunk", true);
-  if (err.status === 429) return fail(503, "upstream_busy", "Transcription service is busy; retry shortly", true, 10);
+  if (err.status === 429) {
+    // Daily limits ask us to wait hours (free tier: 25 requests/day). Retrying
+    // is pointless, and waiting would keep the UI on "Transcribing…".
+    const daily = (err.retryAfterSec ?? 0) > 60 || /per day|daily quota/i.test(err.message);
+    if (daily) {
+      const when = err.retryAfterSec ? ` Retry in ${formatWait(err.retryAfterSec)}.` : "";
+      return fail(
+        429,
+        "quota_exceeded",
+        `Gemini daily limit reached for ${config.geminiModel}.${when} ` +
+          "This API key is on the free tier (25 transcription requests per day); enable billing or use a paid-tier key.",
+        false,
+        err.retryAfterSec,
+      );
+    }
+    return fail(503, "upstream_busy", "Transcription service is busy; retry shortly", true, err.retryAfterSec ?? 10);
+  }
   if (err.status && err.status >= 500) return fail(502, "upstream", "Transcription service error; retry shortly", true);
   if (err.status === 400) return fail(422, "upstream", `Transcription rejected the audio: ${err.message}`);
   return fail(502, "upstream", err.message, err.retryable);

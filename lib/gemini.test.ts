@@ -128,4 +128,23 @@ describe("transcribe", () => {
     );
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it("fails fast instead of waiting out a daily-quota Retry-After", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            error: { message: "Rate limit exceeded for model (limit: 25 requests per day on Free Tier)." },
+          }),
+          { status: 429, headers: { "retry-after": "35084" } },
+        ),
+    );
+    const err = await transcribe({ apiKey: "k", audio, mimeType: "audio/ogg", fetch: fetchMock }).catch((e) => e);
+    expect(err).toBeInstanceOf(GeminiError);
+    expect(err).toMatchObject({ status: 429, retryAfterSec: 35084 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("retry after 9h 44m"));
+    warn.mockRestore();
+  });
 });
