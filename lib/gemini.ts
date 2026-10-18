@@ -12,6 +12,8 @@ import { parseOffset } from "./parse-offsets";
 import type { Word } from "./types";
 
 export const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions";
+/** Lightweight endpoint used to check a visitor's key without spending anything. */
+export const GEMINI_MODELS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
 export const DEFAULT_MODEL = "gemini-3.5-transcribe";
 /** Gemini rejects requests above 20 MB total (base64 inflates audio by ~4/3). */
 export const MAX_INLINE_AUDIO_BYTES = 14 * 1024 * 1024;
@@ -294,4 +296,36 @@ export function sleep(ms: number, signal?: AbortSignal) {
     }, ms);
     signal.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+// ---------------------------------------------------------------------------
+
+export type KeyCheckResult = { ok: true; model: string } | { ok: false; error: string; status?: number };
+
+/**
+ * Verify a visitor's key by reading one model's metadata. Free and instant, and
+ * it distinguishes a bad key (400/403) from a valid key with no quota (429).
+ */
+export async function checkApiKey(req: {
+  apiKey: string;
+  model?: string;
+  fetch?: typeof fetch;
+  signal?: AbortSignal;
+}): Promise<KeyCheckResult> {
+  const model = req.model ?? DEFAULT_MODEL;
+  const doFetch = req.fetch ?? globalThis.fetch;
+  let res: Response;
+  try {
+    res = await doFetch(`${GEMINI_MODELS_ENDPOINT}/${encodeURIComponent(model)}`, {
+      headers: { "x-goog-api-key": req.apiKey },
+      signal: req.signal,
+    });
+  } catch (err) {
+    return { ok: false, error: `Couldn't reach Gemini: ${(err as Error).message}` };
+  }
+  if (res.ok) return { ok: true, model };
+  const body = await res.json().catch(() => undefined);
+  const message = (body as { error?: { message?: string } } | undefined)?.error?.message ?? res.statusText;
+  logUpstreamFailure(res.status, message, parseRetryAfter(res.headers.get("retry-after")));
+  return { ok: false, status: res.status, error: message };
 }

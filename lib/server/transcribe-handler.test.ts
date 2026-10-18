@@ -3,17 +3,15 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import type { ApiError, TranscribeResponse } from "../api-types";
+import { API_KEY_HEADER, type ApiError, type TranscribeResponse } from "../api-types";
 import { GeminiError, type TranscribeRequest, type TranscribeResult } from "../gemini";
 import type { ServerConfig } from "./config";
-import { MemoryQuota } from "./quota";
+import { MemoryLimiter } from "./limits";
 import { handleTranscribe } from "./transcribe-handler";
 
 const baseConfig: ServerConfig = {
-  geminiApiKey: "gem-key",
   geminiModel: "test-model",
   spellModel: "test-text-model",
-  quotaMinutesPerDay: 1,
   requestsPerMinute: 100,
   maxChunkSeconds: 600,
   maxUploadBytes: 4_400_000,
@@ -21,6 +19,9 @@ const baseConfig: ServerConfig = {
   upstashToken: "",
   isProduction: true,
 };
+
+/** Shape-valid fake key; nothing here reaches Google. */
+const TEST_KEY = "AIzaSyTEST-key_0123456789";
 
 let ogg5s: Uint8Array;
 let ogg40s: Uint8Array;
@@ -47,8 +48,10 @@ const okResult = (req: TranscribeRequest): TranscribeResult => ({
   raw: { languages: req.languageCodes },
 });
 
-function request(body: Uint8Array | string, init: { type?: string; query?: string } = {}) {
+function request(body: Uint8Array | string, init: { type?: string; query?: string; key?: string | null } = {}) {
   const headers: Record<string, string> = { "content-type": init.type ?? "audio/ogg" };
+  const key = init.key === undefined ? TEST_KEY : init.key;
+  if (key) headers[API_KEY_HEADER] = key;
   return new Request(`http://localhost/api/transcribe${init.query ?? ""}`, {
     method: "POST",
     headers,
@@ -60,7 +63,7 @@ async function call(req: Request, deps: Parameters<typeof handleTranscribe>[1] =
   const config = deps.config ?? baseConfig;
   const res = await handleTranscribe(req, {
     config,
-    quota: deps.quota ?? new MemoryQuota(config),
+    limiter: deps.limiter ?? new MemoryLimiter(config),
     transcribe: deps.transcribe ?? (async (r) => okResult(r)),
   });
   return { status: res.status, body: (await res.json()) as TranscribeResponse & ApiError, headers: res.headers };
@@ -69,22 +72,29 @@ async function call(req: Request, deps: Parameters<typeof handleTranscribe>[1] =
 vi.spyOn(console, "info").mockImplementation(() => {});
 
 describe("handleTranscribe", () => {
-  it("returns words, server-measured duration and quota", async () => {
+  it("returns words and the server-measured duration, using the caller's key", async () => {
     const transcribe = vi.fn(async (r: TranscribeRequest) => okResult(r));
     const { status, body } = await call(request(ogg5s, { query: "?languages=te-IN,en-IN" }), { transcribe });
     expect(status).toBe(200);
     expect(body.words).toEqual([{ text: "hello", start: 0.1, end: 0.5 }]);
     expect(body.durationSec).toBeCloseTo(5, 1);
     expect(body.model).toBe("test-model");
-    expect(body.quota).toEqual({ usedSeconds: 5, limitSeconds: 60 });
     const sent = transcribe.mock.calls[0][0];
-    expect(sent).toMatchObject({ apiKey: "gem-key", timestamps: true, languageCodes: ["te-IN", "en-IN"] });
+    expect(sent).toMatchObject({ apiKey: TEST_KEY, timestamps: true, languageCodes: ["te-IN", "en-IN"] });
   });
 
-  it("refuses to run without a Gemini key configured", async () => {
-    const { status, body } = await call(request(ogg5s), { config: { ...baseConfig, geminiApiKey: "" } });
-    expect(status).toBe(500);
-    expect(body.code).toBe("misconfigured");
+  it("asks for a key when none is sent", async () => {
+    const { status, body } = await call(request(ogg5s, { key: null }));
+    expect(status).toBe(401);
+    expect(body.code).toBe("needs_api_key");
+    expect(body.error).toMatch(/Settings/);
+  });
+
+  it("rejects a malformed key", async () => {
+    const { status, body } = await call(request(ogg5s, { key: "not a key" }));
+    expect(status).toBe(401);
+    expect(body.code).toBe("needs_api_key");
+    expect(body.error).toMatch(/doesn't look valid/);
   });
 
   it("validates content type, body and language codes", async () => {
@@ -106,32 +116,19 @@ describe("handleTranscribe", () => {
     expect(body.code).toBe("too_long");
   });
 
-  it("enforces the daily quota and refunds failed requests", async () => {
-    const quota = new MemoryQuota(baseConfig); // 60 s/day
-    expect((await call(request(ogg40s), { quota })).status).toBe(200);
+  it("rate-limits per key, so visitors don't share a bucket", async () => {
+    const config = { ...baseConfig, requestsPerMinute: 1 };
+    const limiter = new MemoryLimiter(config);
+    expect((await call(request(ogg40s), { config, limiter })).status).toBe(200);
 
-    // Second 40 s chunk would exceed 60 s.
-    const over = await call(request(ogg40s), { quota });
-    expect(over.status).toBe(429);
-    expect(over.body.code).toBe("quota_exceeded");
-    expect(Number(over.headers.get("retry-after"))).toBeGreaterThan(0);
+    // A different visitor's key has its own window.
+    const other = await call(request(ogg40s, { key: "AIzaSyOTHER-key_9876543210" }), { config, limiter });
+    expect(other.status).toBe(200);
 
-    // A failed 5 s request is refunded, so 20 s of quota stays available.
-    const failing = vi.fn(async () => {
-      throw new GeminiError("Gemini 503: busy", 503, true);
-    });
-    expect((await call(request(ogg5s), { quota, transcribe: failing })).status).toBe(502);
-    const again = await call(request(ogg5s), { quota });
-    expect(again.body.quota.usedSeconds).toBe(45);
-  });
-
-  it("rate-limits requests per minute", async () => {
-    const config = { ...baseConfig, requestsPerMinute: 1, quotaMinutesPerDay: 100 };
-    const quota = new MemoryQuota(config);
-    expect((await call(request(ogg5s), { config, quota })).status).toBe(200);
-    const limited = await call(request(ogg5s), { config, quota });
+    const limited = await call(request(ogg40s), { config, limiter });
     expect(limited.status).toBe(429);
     expect(limited.body).toMatchObject({ code: "rate_limited", retryable: true });
+    expect(Number(limited.headers.get("retry-after"))).toBeGreaterThan(0);
   });
 
   it.each([

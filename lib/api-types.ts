@@ -3,6 +3,13 @@ import type { Word } from "./types";
 
 export const TRANSCRIBE_PATH = "/api/transcribe";
 
+/**
+ * The visitor's own Gemini key, sent on every request that talks to Gemini.
+ * It lives in the browser (localStorage) and is forwarded to Google per request;
+ * the server never stores or logs it.
+ */
+export const API_KEY_HEADER = "x-gemini-api-key";
+
 export type TranscribeResponse = {
   /** Chunk-local times in seconds. */
   words: Word[];
@@ -10,10 +17,10 @@ export type TranscribeResponse = {
   /** Duration measured by the server from the Ogg stream. */
   durationSec: number;
   model: string;
-  quota: { usedSeconds: number; limitSeconds: number };
 };
 
 export type ApiErrorCode =
+  | "needs_api_key"
   | "misconfigured"
   | "bad_request"
   | "unsupported_media"

@@ -3,6 +3,7 @@
  * retries. Uses XMLHttpRequest because fetch can't report upload progress.
  */
 import {
+  API_KEY_HEADER,
   TRANSCRIBE_PATH,
   type ApiError,
   type TranscribeResponse,
@@ -23,6 +24,8 @@ export class TranscribeError extends Error {
 }
 
 export type TranscribeClientOptions = {
+  /** The visitor's own Gemini key; forwarded to Google by our API and never stored. */
+  apiKey: string;
   languages?: string[];
   signal?: AbortSignal;
   /** 0..1 upload progress; after 1 the server is transcribing. */
@@ -35,6 +38,9 @@ export type TranscribeClientOptions = {
 };
 
 export async function transcribeChunk(audio: Blob, opts: TranscribeClientOptions): Promise<TranscribeResponse> {
+  if (!opts.apiKey) {
+    throw new TranscribeError("Add your Gemini API key in Settings", 401, "needs_api_key", false);
+  }
   const maxAttempts = opts.maxAttempts ?? 2;
   for (let attempt = 1; ; attempt++) {
     try {
@@ -56,6 +62,7 @@ function send(audio: Blob, opts: TranscribeClientOptions): Promise<TranscribeRes
     const qs = opts.languages?.length ? `?languages=${encodeURIComponent(opts.languages.join(","))}` : "";
     xhr.open("POST", `${TRANSCRIBE_PATH}${qs}`);
     xhr.setRequestHeader("content-type", "audio/ogg");
+    xhr.setRequestHeader(API_KEY_HEADER, opts.apiKey);
     xhr.responseType = "json";
     xhr.timeout = opts.timeoutMs ?? 295_000;
 

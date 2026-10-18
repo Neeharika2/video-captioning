@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { buildTranscriptionBody, GeminiError, parseInteraction, transcribe } from "./gemini";
+import { buildTranscriptionBody, checkApiKey, GeminiError, parseInteraction, transcribe } from "./gemini";
 
 // Response example from https://ai.google.dev/gemini-api/docs/transcribe
 const docsResponse = {
@@ -145,6 +145,26 @@ describe("transcribe", () => {
     expect(err).toMatchObject({ status: 429, retryAfterSec: 35084 });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("retry after 9h 44m"));
+    warn.mockRestore();
+  });
+});
+
+describe("checkApiKey", () => {
+  it("reports ok and reads the configured model", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => new Response("{}", { status: 200 }));
+    const res = await checkApiKey({ apiKey: "k", model: "my-model", fetch: fetchMock });
+    expect(res).toEqual({ ok: true, model: "my-model" });
+    expect(String(fetchMock.mock.calls[0][0])).toContain("/models/my-model");
+    expect((fetchMock.mock.calls[0][1]?.headers as Record<string, string>)["x-goog-api-key"]).toBe("k");
+  });
+
+  it("surfaces the provider's message when the key is rejected", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchMock = vi.fn<typeof fetch>(
+      async () => new Response(JSON.stringify({ error: { message: "API key not valid" } }), { status: 400 }),
+    );
+    const res = await checkApiKey({ apiKey: "bad", fetch: fetchMock });
+    expect(res).toMatchObject({ ok: false, status: 400, error: "API key not valid" });
     warn.mockRestore();
   });
 });

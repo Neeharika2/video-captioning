@@ -8,12 +8,13 @@ import {
 } from "../api-types";
 import { GeminiError, formatWait, transcribe as geminiTranscribe } from "../gemini";
 import { OggOpusError, oggOpusDuration } from "../ogg-duration";
+import { missingKeyMessage, readApiKey } from "./api-key";
 import { getConfig, type ServerConfig } from "./config";
-import { getQuotaStore, type QuotaStore } from "./quota";
+import { getRateLimiter, type RateLimiter } from "./limits";
 
 export type HandlerDeps = {
   config?: ServerConfig;
-  quota?: QuotaStore;
+  limiter?: RateLimiter;
   transcribe?: typeof geminiTranscribe;
 };
 
@@ -23,25 +24,25 @@ export type HandlerDeps = {
  * Body: one Ogg Opus chunk (Content-Type: audio/ogg), ≤ maxChunkSeconds.
  * Query: ?languages=te-IN,en-IN (optional BCP-47 hints).
  *
- * No auth for now: anyone who can reach the URL can call it. The app-wide
- * daily quota and rate limit cap Gemini spend.
+ * Bring your own key: the visitor's Gemini key arrives in the
+ * `x-gemini-api-key` header, is forwarded to Google for this request and never
+ * stored. Spend therefore belongs to the visitor, so requests are only
+ * rate-limited (per key and endpoint), not capped by a shared daily budget.
  *
  * Stateless: returns chunk-local word timings; the browser stitches chunks.
- * Never logs audio or transcript text.
+ * Never logs audio, transcript text or the key.
  */
-/** Quota bucket shared by all callers until there are user accounts. */
-const QUOTA_SUBJECT = "global";
-
 export async function handleTranscribe(request: Request, deps: HandlerDeps = {}): Promise<Response> {
   const config = deps.config ?? getConfig();
   const started = Date.now();
-
-  if (!config.geminiApiKey) return fail(500, "misconfigured", "Server misconfigured: GEMINI_API_KEY is not set");
 
   const contentType = request.headers.get("content-type")?.split(";")[0].trim().toLowerCase();
   if (contentType !== "audio/ogg" && contentType !== "audio/opus") {
     return fail(415, "unsupported_media", "Send Ogg Opus audio with Content-Type: audio/ogg");
   }
+
+  const apiKey = readApiKey(request);
+  if (!apiKey.ok) return fail(401, "needs_api_key", missingKeyMessage(apiKey.reason));
 
   const url = new URL(request.url);
   const languages = (url.searchParams.get("languages") ?? "")
@@ -74,31 +75,16 @@ export async function handleTranscribe(request: Request, deps: HandlerDeps = {})
     );
   }
 
-  const quota = deps.quota ?? getQuotaStore(config);
-  const decision = await quota.reserve(QUOTA_SUBJECT, durationSec);
+  const limiter = deps.limiter ?? getRateLimiter(config);
+  const decision = await limiter.limit(`transcribe:${apiKey.id}`);
   if (!decision.ok) {
-    log({
-      durationSec,
-      status: 429,
-      error: decision.reason,
-      usedSeconds: decision.usedSeconds,
-      limitSeconds: decision.limitSeconds,
-      retryAfterSec: decision.retryAfterSec,
-    });
-    return fail(
-      429,
-      decision.reason,
-      decision.reason === "rate_limited"
-        ? "Too many requests; slow down"
-        : `Daily audio quota used (${Math.round((decision.usedSeconds ?? 0) / 60)} of ${Math.round((decision.limitSeconds ?? 0) / 60)} min)`,
-      decision.reason === "rate_limited",
-      decision.retryAfterSec,
-    );
+    log({ durationSec, keyId: apiKey.id, status: 429, error: "rate_limited", retryAfterSec: decision.retryAfterSec });
+    return fail(429, "rate_limited", "Too many requests; slow down", true, decision.retryAfterSec);
   }
 
   try {
     const result = await (deps.transcribe ?? geminiTranscribe)({
-      apiKey: config.geminiApiKey,
+      apiKey: apiKey.key,
       model: config.geminiModel,
       audio,
       mimeType: "audio/ogg",
@@ -109,20 +95,26 @@ export async function handleTranscribe(request: Request, deps: HandlerDeps = {})
       timeoutMs: 270_000,
       maxAttempts: 2,
     });
-    log({ durationSec, status: 200, words: result.words.length, ms: Date.now() - started, attempts: result.attempts });
+    log({
+      durationSec,
+      keyId: apiKey.id,
+      status: 200,
+      words: result.words.length,
+      ms: Date.now() - started,
+      attempts: result.attempts,
+    });
     const body: TranscribeResponse = {
       words: result.words,
       text: result.text,
       durationSec,
       model: config.geminiModel,
-      quota: { usedSeconds: decision.usedSeconds, limitSeconds: decision.limitSeconds },
     };
     return Response.json(body);
   } catch (err) {
-    await quota.refund(QUOTA_SUBJECT, durationSec).catch(() => {});
     const res = mapUpstreamError(err, config);
     log({
       durationSec,
+      keyId: apiKey.id,
       status: res.status,
       ms: Date.now() - started,
       upstreamStatus: err instanceof GeminiError ? err.status : undefined,

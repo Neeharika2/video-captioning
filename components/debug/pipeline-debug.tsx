@@ -13,6 +13,7 @@ import type { TranscribeResponse } from "@/lib/api-types";
 import type { ExtractEngine, ExtractResult } from "@/lib/client/extract-audio";
 import { downloadText } from "@/lib/client/save-file";
 import { offsetWords, TranscribeError } from "@/lib/client/transcribe-client";
+import { clearApiKey, getApiKey, setApiKey as storeApiKey } from "@/lib/client/api-key";
 import { DEFAULT_GROUP_OPTIONS, groupWords, wrapLines } from "@/lib/group-words";
 import { hasNonLatinLetters, romanize } from "@/lib/romanize";
 import { latinPunctuation, parseGlossary, type SpelledWord } from "@/lib/spelling";
@@ -20,6 +21,7 @@ import type { Word } from "@/lib/types";
 import { DEFAULT_STYLE, type CaptionPlacement, type CaptionStyle } from "@/lib/caption-style";
 import { CaptionPlayer } from "./caption-player";
 import { ExportMenu } from "./export-menu";
+import { ApiKeyField } from "./api-key-field";
 import { StylePicker } from "./style-picker";
 import { Timeline } from "./timeline";
 
@@ -94,6 +96,8 @@ export function PipelineDebug() {
   const [elapsedSec, setElapsedSec] = useState(0);
   const [dragOver, setDragOver] = useState(false);
   const [tab, setTab] = useState<"style" | "settings">("style");
+  /** The visitor's own Gemini key; null until they add one. */
+  const [apiKey, setApiKey] = useState<string | null>(getApiKey);
   const videoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -199,6 +203,13 @@ export function PipelineDebug() {
     setLog((l) => [...l, `${new Date().toLocaleTimeString()}  ${line}`]);
   }, []);
 
+  /** Keep the header source of truth (localStorage) in sync with the UI. */
+  const updateApiKey = useCallback((key: string | null) => {
+    setApiKey(key);
+    if (key) storeApiKey(key);
+    else clearApiKey();
+  }, []);
+
   const runSpelling = async (source: Word[]) => {
     spellAbortRef.current?.abort();
     setSpelled(null);
@@ -209,6 +220,11 @@ export function PipelineDebug() {
     const abort = new AbortController();
     spellAbortRef.current = abort;
     const total = source.length;
+    const key = getApiKey();
+    if (!key) {
+      setSpellStatus({ step: "done", warn: true, message: "Add your Gemini API key in Settings to fix spelling." });
+      return;
+    }
     let done = 0;
     setSpellStatus({ step: "running", done, total });
     const started = Date.now();
@@ -217,6 +233,7 @@ export function PipelineDebug() {
       const summary = await spellWords(
         source.map((w) => w.text),
         {
+          apiKey: key,
           glossary: parseGlossary(settings.glossary),
           languages: languageList(settings.languages),
           signal: abort.signal,
@@ -277,6 +294,13 @@ export function PipelineDebug() {
 
   const run = async () => {
     if (!file) return;
+    const key = getApiKey();
+    if (!key) {
+      setTab("settings");
+      addLog("Error: add your Gemini API key in Settings");
+      setStatus({ step: "error", message: "Add your Gemini API key in Settings, then try again." });
+      return;
+    }
     const abort = new AbortController();
     abortRef.current = abort;
     setResult(null);
@@ -315,6 +339,7 @@ export function PipelineDebug() {
       const languages = languageList(settings.languages);
       const sentAt = Date.now();
       const res = await transcribeChunk(ex.audio, {
+        apiKey: key,
         languages,
         signal: abort.signal,
         onUploadProgress: (p) =>
@@ -331,13 +356,14 @@ export function PipelineDebug() {
       setWords(timed);
       addLog(
         `Transcribed in ${((Date.now() - sentAt) / 1000).toFixed(1)} s → ${res.words.length} words ` +
-          `(server-measured ${res.durationSec.toFixed(1)} s; quota ${Math.round(res.quota.usedSeconds / 60)}/${Math.round(res.quota.limitSeconds / 60)} min)`,
+          `(server-measured ${res.durationSec.toFixed(1)} s)`,
       );
       setStatus({ step: "done" });
       void runSpelling(timed);
     } catch (err) {
       const message =
         err instanceof TranscribeError ? `${err.message} [${err.status || ""} ${err.code}]` : (err as Error).message;
+      if (err instanceof TranscribeError && err.code === "needs_api_key") setTab("settings");
       addLog(`Error: ${message}`);
       setStatus({ step: "error", message });
     }
@@ -466,6 +492,17 @@ export function PipelineDebug() {
               <ScriptToggle value={settings.script} onChange={(script) => setSettings({ ...settings, script })} />
             )}
           </div>
+          {file && !apiKey && !busy && (
+            <p
+              className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:bg-amber-500/10 dark:text-amber-400"
+              data-testid="api-key-notice"
+            >
+              Add your Gemini API key to make captions.{" "}
+              <button type="button" className="underline" onClick={() => setTab("settings")}>
+                Open settings
+              </button>
+            </p>
+          )}
           {file &&
             (busy ? (
               <button
@@ -622,6 +659,8 @@ export function PipelineDebug() {
           </div>
 
           <div className={`${tab === "settings" ? "flex" : "hidden"} min-h-0 flex-1 flex-col gap-5 overflow-y-auto p-4 text-sm`}>
+            <ApiKeyField value={apiKey} onChange={updateApiKey} />
+
             <label className="flex flex-col gap-1.5">
               <span className="font-medium">Language hints (optional)</span>
               <input

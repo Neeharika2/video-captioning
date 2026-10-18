@@ -1,16 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
+import { API_KEY_HEADER } from "../api-types";
 import { GeminiError } from "../gemini";
 import type { generateJson } from "../gemini-text";
 import type { SpellResponse } from "../spelling";
 import type { ServerConfig } from "./config";
-import { MemoryQuota } from "./quota";
+import { MemoryLimiter } from "./limits";
 import { handleSpell } from "./spell-handler";
 
 const config: ServerConfig = {
-  geminiApiKey: "gem-key",
   geminiModel: "test-model",
   spellModel: "test-text-model",
-  quotaMinutesPerDay: 1,
   requestsPerMinute: 100,
   maxChunkSeconds: 600,
   maxUploadBytes: 4_400_000,
@@ -19,10 +18,16 @@ const config: ServerConfig = {
   isProduction: true,
 };
 
-function post(body: unknown, contentType = "application/json") {
+/** Shape-valid fake key; nothing here reaches Google. */
+const TEST_KEY = "AIzaSyTEST-key_0123456789";
+
+function post(body: unknown, init: { type?: string; key?: string | null } = {}) {
+  const headers: Record<string, string> = { "content-type": init.type ?? "application/json" };
+  const key = init.key === undefined ? TEST_KEY : init.key;
+  if (key) headers[API_KEY_HEADER] = key;
   return new Request("http://localhost/api/spell", {
     method: "POST",
-    headers: { "content-type": contentType },
+    headers,
     body: typeof body === "string" ? body : JSON.stringify(body),
   });
 }
@@ -31,8 +36,13 @@ function generator(json: unknown) {
   return vi.fn<typeof generateJson>(async () => ({ json, latencyMs: 5, attempts: 1 }));
 }
 
+function deps(overrides: Partial<ServerConfig> = {}, generate = generator({ words: [] })) {
+  const cfg = { ...config, ...overrides };
+  return { config: cfg, limiter: new MemoryLimiter(cfg), generate };
+}
+
 describe("handleSpell", () => {
-  it("returns checked spellings, one per word", async () => {
+  it("returns checked spellings, one per word, using the caller's key", async () => {
     const generate = generator({
       words: [
         { id: 0, text: "ee", english: false },
@@ -41,9 +51,7 @@ describe("handleSpell", () => {
       ],
     });
     const res = await handleSpell(post({ words: ["ఈ", "రోజు", "టాపిక్"], glossary: ["LLMs"] }), {
-      config,
-      quota: new MemoryQuota(config),
-      generate,
+      ...deps({}, generate),
     });
     expect(res.status).toBe(200);
     const body = (await res.json()) as SpellResponse;
@@ -53,32 +61,34 @@ describe("handleSpell", () => {
     const call = generate.mock.calls[0][0];
     expect(call.model).toBe("test-text-model");
     expect(call.prompt).toContain("Glossary: LLMs");
-    expect(call.apiKey).toBe("gem-key");
+    expect(call.apiKey).toBe(TEST_KEY);
   });
 
   it("validates the request", async () => {
-    const deps = { config, quota: new MemoryQuota(config), generate: generator({ words: [] }) };
-    expect((await handleSpell(post({ words: [] }), deps)).status).toBe(400);
-    expect((await handleSpell(post("{oops"), deps)).status).toBe(400);
-    expect((await handleSpell(post({ words: ["a"] }, "text/plain"), deps)).status).toBe(415);
-    expect((await handleSpell(post({ words: Array(301).fill("a") }), deps)).status).toBe(400);
-    expect((await handleSpell(post({ words: ["a"], languages: ["not a code"] }), deps)).status).toBe(400);
-    expect((await handleSpell(post({ words: ["x".repeat(70_000)] }), deps)).status).toBe(413);
-    expect(deps.generate).not.toHaveBeenCalled();
+    const d = deps();
+    expect((await handleSpell(post({ words: [] }), d)).status).toBe(400);
+    expect((await handleSpell(post("{oops"), d)).status).toBe(400);
+    expect((await handleSpell(post({ words: ["a"] }, { type: "text/plain" }), d)).status).toBe(415);
+    expect((await handleSpell(post({ words: Array(301).fill("a") }), d)).status).toBe(400);
+    expect((await handleSpell(post({ words: ["a"], languages: ["not a code"] }), d)).status).toBe(400);
+    expect((await handleSpell(post({ words: ["x".repeat(70_000)] }), d)).status).toBe(413);
+    expect(d.generate).not.toHaveBeenCalled();
   });
 
-  it("needs the Gemini key", async () => {
-    const res = await handleSpell(post({ words: ["a"] }), { config: { ...config, geminiApiKey: "" } });
-    expect(res.status).toBe(500);
+  it("asks for a key when none is sent", async () => {
+    const res = await handleSpell(post({ words: ["a"] }, { key: null }), deps());
+    expect(res.status).toBe(401);
+    expect((await res.json()).code).toBe("needs_api_key");
   });
 
-  it("rate limits", async () => {
-    const strict = { ...config, requestsPerMinute: 1 };
-    const deps = { config: strict, quota: new MemoryQuota(strict), generate: generator({ words: [] }) };
-    expect((await handleSpell(post({ words: ["a"] }), deps)).status).toBe(200);
-    const res = await handleSpell(post({ words: ["a"] }), deps);
+  it("rate-limits per key", async () => {
+    const d = deps({ requestsPerMinute: 1 });
+    expect((await handleSpell(post({ words: ["a"] }), d)).status).toBe(200);
+    const res = await handleSpell(post({ words: ["a"] }), d);
     expect(res.status).toBe(429);
     expect(res.headers.get("retry-after")).toBeTruthy();
+    // A different key still works.
+    expect((await handleSpell(post({ words: ["a"] }, { key: "AIzaSyOTHER-key_9876543210" }), d)).status).toBe(200);
   });
 
   it.each([
@@ -90,7 +100,7 @@ describe("handleSpell", () => {
     const generate = vi.fn<typeof generateJson>(async () => {
       throw error;
     });
-    const res = await handleSpell(post({ words: ["a"] }), { config, quota: new MemoryQuota(config), generate });
+    const res = await handleSpell(post({ words: ["a"] }), deps({}, generate));
     expect(res.status).toBe(status);
     expect(((await res.json()) as { code: string }).code).toBe(code);
   });

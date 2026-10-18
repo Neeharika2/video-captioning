@@ -5,6 +5,7 @@
  * unless the user cancels.
  */
 import type { ApiError } from "../api-types";
+import { apiKeyHeaders } from "./api-key";
 import { hasNonLatinLetters } from "../romanize";
 import {
   MAX_SPELL_WORDS,
@@ -21,6 +22,8 @@ const MAX_ATTEMPTS = 3;
 const MAX_WAIT_MS = 30_000;
 
 export type SpellOptions = {
+  /** The visitor's own Gemini key; forwarded to Google by our API and never stored. */
+  apiKey: string;
   glossary?: string[];
   languages?: string[];
   signal?: AbortSignal;
@@ -60,8 +63,9 @@ export function planBatches(words: string[], size = BATCH_WORDS): { start: numbe
   return out;
 }
 
-export async function spellWords(words: string[], opts: SpellOptions = {}): Promise<SpellSummary> {
+export async function spellWords(words: string[], opts: SpellOptions): Promise<SpellSummary> {
   const summary: SpellSummary = { accepted: 0, rejected: 0, failed: 0, batches: 0 };
+  if (!opts.apiKey) throw new Error("Add your Gemini API key in Settings");
   // Only batches with non-Latin text need the model.
   const batches = planBatches(words).filter((b) => words.slice(b.start, b.end).some(hasNonLatinLetters));
   summary.batches = batches.length;
@@ -78,7 +82,7 @@ export async function spellWords(words: string[], opts: SpellOptions = {}): Prom
         ...(opts.languages?.length ? { languages: opts.languages } : {}),
       };
       try {
-        const res = await postBatch(request, opts.signal);
+        const res = await postBatch(request, opts.apiKey, opts.signal);
         summary.model = res.model;
         summary.rejected += res.rejected;
         summary.accepted += res.words.filter(Boolean).length;
@@ -94,12 +98,12 @@ export async function spellWords(words: string[], opts: SpellOptions = {}): Prom
   return summary;
 }
 
-async function postBatch(body: SpellRequest, signal?: AbortSignal): Promise<SpellResponse> {
+async function postBatch(body: SpellRequest, apiKey: string, signal?: AbortSignal): Promise<SpellResponse> {
   if (body.words.length > MAX_SPELL_WORDS) throw new Error("Batch too large");
   for (let attempt = 1; ; attempt++) {
     const res = await fetch(SPELL_PATH, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...apiKeyHeaders(apiKey) },
       body: JSON.stringify(body),
       signal,
     });

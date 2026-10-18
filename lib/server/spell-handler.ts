@@ -11,34 +11,37 @@ import {
   type SpellResponse,
 } from "../spelling";
 import { getConfig, type ServerConfig } from "./config";
-import { getQuotaStore, type QuotaStore } from "./quota";
+import { missingKeyMessage, readApiKey } from "./api-key";
+import { getRateLimiter, type RateLimiter } from "./limits";
 
 export type SpellDeps = {
   config?: ServerConfig;
-  quota?: QuotaStore;
+  limiter?: RateLimiter;
   generate?: typeof generateJson;
 };
 
-/** Own rate-limit bucket, so spelling batches don't eat transcription's. */
-const RATE_SUBJECT = "spell";
 const MAX_BODY_BYTES = 64_000;
 
 /**
  * POST /api/spell
  *
  * Body (JSON): { words: string[], before?, after?, glossary?, languages? }
- * Returns one spelling per word, or null where the model's answer failed the
- * checks in lib/spelling.ts (the client keeps its rule-based spelling there).
- * Never logs transcript text.
+ * Header: `x-gemini-api-key` — the visitor's own key, forwarded to Google and
+ * never stored. Returns one spelling per word, or null where the model's answer
+ * failed the checks in lib/spelling.ts (the client keeps its rule-based
+ * spelling there). Never logs transcript text or the key.
  */
 export async function handleSpell(request: Request, deps: SpellDeps = {}): Promise<Response> {
   const config = deps.config ?? getConfig();
   const started = Date.now();
-  if (!config.geminiApiKey) return fail(500, "misconfigured", "Server misconfigured: GEMINI_API_KEY is not set");
 
   if (request.headers.get("content-type")?.split(";")[0].trim() !== "application/json") {
     return fail(415, "unsupported_media", "Send JSON with Content-Type: application/json");
   }
+
+  const apiKey = readApiKey(request);
+  if (!apiKey.ok) return fail(401, "needs_api_key", missingKeyMessage(apiKey.reason));
+
   const raw = await request.text();
   if (raw.length > MAX_BODY_BYTES) return fail(413, "too_large", "Too much text in one request");
   let body: unknown;
@@ -51,15 +54,16 @@ export async function handleSpell(request: Request, deps: SpellDeps = {}): Promi
   if (!parsed.success) return fail(400, "bad_request", `Invalid request: ${parsed.error.issues[0]?.message ?? "bad shape"}`);
   const req = parsed.data;
 
-  const quota = deps.quota ?? getQuotaStore(config);
-  const decision = await quota.reserve(RATE_SUBJECT, 0);
+  const limiter = deps.limiter ?? getRateLimiter(config);
+  const decision = await limiter.limit(`spell:${apiKey.id}`);
   if (!decision.ok) {
+    log({ status: 429, keyId: apiKey.id, words: req.words.length, error: "rate_limited", retryAfterSec: decision.retryAfterSec });
     return fail(429, "rate_limited", "Too many requests; slow down", true, decision.retryAfterSec);
   }
 
   try {
     const result = await (deps.generate ?? generateJson)({
-      apiKey: config.geminiApiKey,
+      apiKey: apiKey.key,
       model: config.spellModel,
       system: SPELL_SYSTEM_PROMPT,
       prompt: buildSpellPrompt(req),
@@ -71,6 +75,7 @@ export async function handleSpell(request: Request, deps: SpellDeps = {}): Promi
     const { words, rejections } = reconcileSpelling(req.words, result.json, req.glossary);
     log({
       status: 200,
+      keyId: apiKey.id,
       words: req.words.length,
       rejected: rejections.length,
       reasons: countBy(rejections.map((r) => r.reason)),
@@ -81,7 +86,7 @@ export async function handleSpell(request: Request, deps: SpellDeps = {}): Promi
     return Response.json(response);
   } catch (err) {
     const res = mapUpstreamError(err);
-    log({ status: res.status, words: req.words.length, ms: Date.now() - started, error: (err as Error).message });
+    log({ status: res.status, keyId: apiKey.id, words: req.words.length, ms: Date.now() - started, error: (err as Error).message });
     return res;
   }
 }

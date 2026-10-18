@@ -20,14 +20,24 @@ async function mockApi(page: Page, words = [{ text: "Hello", start: 0.2, end: 0.
       text: words.map((w) => w.text).join(" "),
       durationSec,
       model: "mock",
-      quota: { usedSeconds: Math.ceil(durationSec), limitSeconds: 7200 },
     };
     await route.fulfill({ json: body });
   });
   return captured;
 }
 
-async function runPipeline(page: Page, file: string, engine?: "mediabunny" | "ffmpeg") {
+/** Shape-valid fake key so the client-side "missing key" guard passes. */
+const E2E_KEY = "AIzaSyE2E-test-key_0123456789";
+
+async function runPipeline(
+  page: Page,
+  file: string,
+  engine?: "mediabunny" | "ffmpeg",
+  opts: { withKey?: boolean } = {},
+) {
+  if (opts.withKey !== false) {
+    await page.addInitScript((key) => window.localStorage.setItem("vc.geminiApiKey", key), E2E_KEY);
+  }
   await page.goto("/debug");
   if (engine) {
     await page.getByTestId("advanced").click();
@@ -270,20 +280,38 @@ test("server errors are shown with their code", async ({ page }) => {
   await page.route("**/api/transcribe**", (route) =>
     route.fulfill({
       status: 429,
-      json: { error: "Daily audio quota used (120 of 120 min)", code: "quota_exceeded", retryable: false, retryAfterSec: 3600 },
+      json: {
+        error:
+          "Gemini daily limit reached for gemini-3.5-transcribe. Retry in 9h 43m. This API key is on the free tier (25 transcription requests per day); enable billing or use a paid-tier key.",
+        code: "quota_exceeded",
+        retryable: false,
+        retryAfterSec: 35_084,
+      },
     }),
   );
   await runPipeline(page, "speech.mp4");
-  await expect(page.getByTestId("status")).toContainText("Daily audio quota used", { timeout: 60_000 });
+  await expect(page.getByTestId("status")).toContainText("Gemini daily limit reached", { timeout: 60_000 });
   await expect(page.getByTestId("status")).toContainText("quota_exceeded");
 });
 
-// Real end-to-end run against Gemini. Costs ~$0.001. Opt in with E2E_REAL=1.
+// Real end-to-end run against Gemini. Costs a fraction of a cent. Opt in with
+// E2E_REAL=1 and a personal GEMINI_API_KEY (the app no longer ships a shared key).
 test("real transcription through the API route", async ({ page }) => {
-  test.skip(!process.env.E2E_REAL, "set E2E_REAL=1 to call Gemini");
-  await runPipeline(page, "speech.mp4");
+  const key = process.env.GEMINI_API_KEY;
+  test.skip(!process.env.E2E_REAL || !key, "set E2E_REAL=1 and GEMINI_API_KEY to call Gemini");
+  await page.addInitScript((k) => window.localStorage.setItem("vc.geminiApiKey", k), key!);
+  await runPipeline(page, "speech.mp4", undefined, { withKey: false });
   await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 120_000 });
   const words = page.getByTestId("words");
   await expect(words).toContainText("Kubernetes");
   expect(await words.getByRole("button").count()).toBeGreaterThan(8);
+});
+
+test("asks for a personal API key when none is set", async ({ page }) => {
+  const captured = await mockApi(page);
+  await runPipeline(page, "speech.mp4", undefined, { withKey: false });
+  await expect(page.getByTestId("status")).toContainText("Gemini API key", { timeout: 15_000 });
+  await expect(page.getByTestId("api-key")).toBeVisible();
+  await expect(page.getByTestId("api-key-notice")).toBeVisible();
+  expect(captured).toHaveLength(0);
 });
