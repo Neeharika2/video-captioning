@@ -65,6 +65,33 @@ test("clicking a word seeks the video and highlights it", async ({ page }) => {
   expect(t).toBeCloseTo(0.6, 1);
 });
 
+test("preview keeps the video's own aspect ratio and captions stay in frame", async ({ page }) => {
+  await mockApi(page);
+  await runPipeline(page, "speech.mp4");
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+
+  await page.getByTestId("captions").getByRole("button").first().click();
+  await expect(page.getByTestId("overlay")).toBeVisible();
+  await page.waitForFunction(() => (document.querySelector("video") as HTMLVideoElement | null)?.videoWidth);
+
+  const info = await page.evaluate(() => {
+    const video = document.querySelector("video") as HTMLVideoElement;
+    const overlay = document.querySelector('[data-testid="overlay"]') as HTMLElement;
+    const v = video.getBoundingClientRect();
+    const o = overlay.getBoundingClientRect();
+    return {
+      intrinsic: video.videoWidth / video.videoHeight,
+      rendered: v.width / v.height,
+      // Overlay should sit exactly on the video, not on letterbox bars.
+      dx: Math.abs(o.left - v.left) + Math.abs(o.right - v.right),
+      dy: Math.abs(o.top - v.top) + Math.abs(o.bottom - v.bottom),
+    };
+  });
+  expect(info.rendered).toBeCloseTo(info.intrinsic, 1);
+  expect(info.dx).toBeLessThan(2);
+  expect(info.dy).toBeLessThan(2);
+});
+
 test("captions are grouped and downloadable as SRT", async ({ page }) => {
   await mockApi(page);
   await runPipeline(page, "speech.mp4");
@@ -72,6 +99,7 @@ test("captions are grouped and downloadable as SRT", async ({ page }) => {
   await expect(page.getByTestId("captions")).toContainText("Hello everyone.");
 
   const srt = page.waitForEvent("download");
+  await page.getByTestId("export-menu").click();
   await page.getByRole("button", { name: "Download .srt" }).click();
   const srtPath = await (await srt).path();
   const text = (await import("node:fs")).readFileSync(srtPath, "utf8");

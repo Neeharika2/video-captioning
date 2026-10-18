@@ -1,16 +1,27 @@
 "use client";
 
-import { type DragEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type DragEvent,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { TranscribeResponse } from "@/lib/api-types";
 import type { ExtractEngine, ExtractResult } from "@/lib/client/extract-audio";
 import { downloadText } from "@/lib/client/save-file";
 import { offsetWords, TranscribeError } from "@/lib/client/transcribe-client";
-import { groupWords } from "@/lib/group-words";
+import { DEFAULT_GROUP_OPTIONS, groupWords, wrapLines } from "@/lib/group-words";
 import { hasNonLatinLetters, romanize } from "@/lib/romanize";
 import { latinPunctuation, parseGlossary, type SpelledWord } from "@/lib/spelling";
 import type { Word } from "@/lib/types";
+import { DEFAULT_STYLE, type CaptionStyle } from "@/lib/caption-style";
 import { CaptionPlayer } from "./caption-player";
-import { ExportPanel } from "./export-panel";
+import { ExportMenu } from "./export-menu";
+import { StylePicker } from "./style-picker";
+import { Timeline } from "./timeline";
 
 /** Phase 1 limit (PLAN.md): one ≤10 min chunk per video. */
 const MAX_SECONDS = 600;
@@ -29,7 +40,8 @@ type CaptionScript = "roman" | "original";
 type Settings = {
   languages: string;
   engine: "auto" | ExtractEngine;
-  highlightWords: boolean;
+  /** Look of the captions in the preview and the burned-in export. */
+  style: CaptionStyle;
   script: CaptionScript;
   /** Gemini pass that fixes romanized spelling and restores English words. */
   smartSpelling: boolean;
@@ -46,7 +58,7 @@ function loadSettings(): Settings {
   const fallback: Settings = {
     languages: "",
     engine: "auto",
-    highlightWords: true,
+    style: DEFAULT_STYLE,
     script: "roman",
     smartSpelling: true,
     glossary: "",
@@ -56,7 +68,7 @@ function loadSettings(): Settings {
     return {
       languages: saved.languages ?? fallback.languages,
       engine: saved.engine ?? fallback.engine,
-      highlightWords: saved.highlightWords ?? fallback.highlightWords,
+      style: { ...fallback.style, ...(saved.style ?? {}) },
       // Not restored: captions always start in English letters.
       script: fallback.script,
       smartSpelling: saved.smartSpelling ?? fallback.smartSpelling,
@@ -81,6 +93,7 @@ export function PipelineDebug() {
   const [activeIndex, setActiveIndex] = useState(-1);
   const [elapsedSec, setElapsedSec] = useState(0);
   const [dragOver, setDragOver] = useState(false);
+  const [tab, setTab] = useState<"style" | "settings">("style");
   const videoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -101,8 +114,26 @@ export function PipelineDebug() {
       }),
     [words, spelled, settings.script],
   );
+  /** User edits, per cue id. Cleared whenever the captions are rebuilt. */
+  const [captionEdits, setCaptionEdits] = useState<Record<string, string>>({});
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
   // Caption cues on the video timeline, built from the word timings.
-  const captions = useMemo(() => groupWords(displayWords), [displayWords]);
+  const baseCaptions = useMemo(() => groupWords(displayWords), [displayWords]);
+  // User edits win over the derived text, and are re-wrapped to keep the layout.
+  const captions = useMemo(
+    () =>
+      baseCaptions.map((c) => {
+        const edited = captionEdits[c.id];
+        if (edited === undefined || edited === c.text) return c;
+        return {
+          ...c,
+          text: edited,
+          lines: wrapLines(edited, DEFAULT_GROUP_OPTIONS.maxCharsPerLine, DEFAULT_GROUP_OPTIONS.maxLines),
+        };
+      }),
+    [baseCaptions, captionEdits],
+  );
   const romanized = settings.script === "roman" && hasForeign;
   const language = romanized ? undefined : settings.languages.split(",")[0]?.trim() || undefined;
 
@@ -213,6 +244,8 @@ export function PipelineDebug() {
     spellAbortRef.current?.abort();
     setSpelled(null);
     setSpellStatus({ step: "idle" });
+    setCaptionEdits({});
+    setEditingId(null);
     setFile(f);
     setVideoUrl(f ? URL.createObjectURL(f) : null);
     setAudioUrl(null);
@@ -232,6 +265,8 @@ export function PipelineDebug() {
     spellAbortRef.current?.abort();
     setSpelled(null);
     setSpellStatus({ step: "idle" });
+    setCaptionEdits({});
+    setEditingId(null);
     try {
       // 1. Extract
       setStatus({ step: "extracting", progress: 0, engine: settings.engine === "ffmpeg" ? "ffmpeg" : "mediabunny" });
@@ -296,6 +331,25 @@ export function PipelineDebug() {
     if (videoRef.current) videoRef.current.currentTime = t;
   };
 
+  const startEdit = (id: string, text: string) => {
+    setEditingId(id);
+    setDraft(text);
+  };
+
+  /** Save a caption edit; empty input is ignored and an unchanged edit is dropped. */
+  const commitEdit = (id: string, value: string) => {
+    const clean = value.replace(/\s+/g, " ").trim();
+    setEditingId(null);
+    if (!clean) return;
+    const base = baseCaptions.find((c) => c.id === id);
+    setCaptionEdits((prev) => {
+      const next = { ...prev };
+      if (base && clean === base.text) delete next[id];
+      else next[id] = clean;
+      return next;
+    });
+  };
+
   const onDrop = (e: DragEvent) => {
     e.preventDefault();
     setDragOver(false);
@@ -304,288 +358,337 @@ export function PipelineDebug() {
   };
 
   return (
-    <div className="mx-auto flex w-full max-w-3xl flex-col gap-8 px-4 py-10 sm:px-6 sm:py-14">
-      <header className="flex flex-col gap-3">
-        <span className="w-fit rounded-full border border-zinc-200 px-3 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
-          Your video never leaves your device
-        </span>
-        <h1 className="text-3xl font-semibold tracking-tight text-balance sm:text-4xl">Add captions to your video</h1>
-        <p className="max-w-2xl text-zinc-500">
-          Pick a video and we&apos;ll transcribe the speech and time every caption. Only the compressed audio is sent to
-          the server and Google — never the video itself.
-        </p>
-      </header>
+    <div className="flex min-h-dvh flex-col bg-zinc-50 lg:h-dvh dark:bg-zinc-950">
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="video/*,audio/*,.mkv,.mov"
+        data-testid="file-input"
+        onChange={(e) => pickFile(e.target.files?.[0] ?? null)}
+        className="sr-only"
+      />
 
-      <section className="flex flex-col gap-5 rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-950 sm:p-6">
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="video/*,audio/*,.mkv,.mov"
-          data-testid="file-input"
-          onChange={(e) => pickFile(e.target.files?.[0] ?? null)}
-          className="sr-only"
-        />
+      {/* Toolbar */}
+      <header className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-950">
+        <div className="flex min-w-0 items-center gap-3">
+          <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900">
+            <svg viewBox="0 0 24 24" fill="none" className="h-4 w-4" aria-hidden="true">
+              <rect x="3" y="5" width="18" height="14" rx="2" stroke="currentColor" strokeWidth="1.75" />
+              <path d="M7 14h6M7 10h10" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" />
+            </svg>
+          </span>
+          <div className="min-w-0">
+            <p className="truncate text-sm leading-tight font-semibold">{file ? file.name : "New project"}</p>
+            <p className="truncate text-xs text-zinc-500">
+              {file ? `${mb(file.size)} · your video never leaves your device` : "Add captions to any video"}
+            </p>
+          </div>
+        </div>
 
-        {!file ? (
+        <div className="ml-auto flex items-center gap-2">
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            onDragOver={(e) => {
-              e.preventDefault();
-              setDragOver(true);
-            }}
-            onDragLeave={() => setDragOver(false)}
-            onDrop={onDrop}
-            className={`flex flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed px-6 py-14 text-center transition ${
-              dragOver
-                ? "border-zinc-900 bg-zinc-50 dark:border-zinc-100 dark:bg-zinc-900"
-                : "border-zinc-300 hover:border-zinc-400 hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-900"
-            }`}
+            disabled={busy}
+            className="rounded-full px-3 py-2 text-sm text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-900 disabled:opacity-40 dark:hover:bg-zinc-900 dark:hover:text-zinc-100"
           >
-            <span className="flex h-12 w-12 items-center justify-center rounded-full bg-zinc-100 dark:bg-zinc-900">
-              <svg viewBox="0 0 24 24" fill="none" className="h-6 w-6 text-zinc-500" aria-hidden="true">
-                <path
-                  d="M12 16V4m0 0L8 8m4-4 4 4M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"
-                  stroke="currentColor"
-                  strokeWidth="1.75"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              </svg>
-            </span>
-            <span className="font-medium">Drop a video here, or click to choose</span>
-            <span className="text-xs text-zinc-500">MP4, MOV, MKV, WebM, AVI — up to 10 minutes</span>
+            {file ? "Choose another" : "Choose video"}
           </button>
-        ) : (
-          <div className="flex flex-col gap-5">
-            {videoUrl && (
-              <CaptionPlayer
-                src={videoUrl}
-                captions={captions}
-                language={language}
-                highlightWords={settings.highlightWords}
-                videoRef={videoRef}
-              />
-            )}
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="min-w-0">
-                <p className="truncate text-sm font-medium">{file.name}</p>
-                <p className="text-xs text-zinc-500">{mb(file.size)}</p>
-              </div>
-              <div className="flex items-center gap-3">
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={busy}
-                  className="text-sm text-zinc-500 underline underline-offset-4 hover:text-zinc-900 disabled:opacity-40 dark:hover:text-zinc-100"
-                >
-                  Choose another
-                </button>
-                {busy ? (
-                  <button
-                    type="button"
-                    onClick={() => abortRef.current?.abort()}
-                    className="rounded-full border border-zinc-300 px-5 py-2.5 text-sm font-medium transition hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-900"
-                  >
-                    Cancel
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={run}
-                    className="rounded-full bg-zinc-900 px-5 py-2.5 text-sm font-medium text-white transition hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
-                  >
-                    {status.step === "done" ? "Redo captions" : "Make captions"}
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
-        )}
+          <ExportMenu file={file} captions={captions} style={settings.style} disabled={busy} />
+        </div>
+      </header>
 
-        {status.step !== "idle" && (
-          <div className="flex flex-col gap-2.5" data-testid="progress">
-            {status.step !== "done" && status.step !== "error" && (
-              <ProgressBar value={status.step === "transcribing" ? undefined : status.progress} />
-            )}
-            <StatusLine status={status} elapsedSec={elapsedSec} />
-          </div>
-        )}
-      </section>
-
-      {captions.length > 0 && (
-        <section className="flex flex-col gap-3">
+      {/* Workspace */}
+      <div className="grid flex-1 grid-cols-1 lg:min-h-0 lg:grid-cols-[300px_minmax(0,1fr)_340px]">
+        {/* Captions */}
+        <aside className="order-2 flex min-h-0 flex-col gap-3 overflow-y-auto border-t border-zinc-200 p-4 lg:order-1 lg:border-t-0 lg:border-r dark:border-zinc-800">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-baseline gap-3">
-              <h2 className="text-lg font-medium">Captions</h2>
-              <span className="text-xs text-zinc-500">{captions.length} lines · click one to jump</span>
-            </div>
+            <h2 className="text-sm font-semibold">
+              Captions
+              {captions.length > 0 && <span className="ml-1.5 font-normal text-zinc-400">{captions.length}</span>}
+            </h2>
             {hasForeign && (
               <ScriptToggle value={settings.script} onChange={(script) => setSettings({ ...settings, script })} />
             )}
           </div>
-          <SpellStatusLine status={spellStatus} />
-          <ol
-            className="max-h-80 divide-y divide-zinc-100 overflow-auto rounded-2xl border border-zinc-200 dark:divide-zinc-900 dark:border-zinc-800"
-            data-testid="captions"
-          >
-            {captions.map((c) => (
-              <li key={c.id}>
-                <button
-                  type="button"
-                  onClick={() => seek(c.start)}
-                  className="flex w-full items-start gap-3 px-4 py-2.5 text-left text-sm transition hover:bg-zinc-50 dark:hover:bg-zinc-900"
-                >
-                  <span className="mt-0.5 shrink-0 font-mono text-xs tabular-nums text-zinc-400">{clock(c.start)}</span>
-                  <span>{c.lines?.join(" ") ?? c.text}</span>
-                </button>
-              </li>
-            ))}
-          </ol>
-        </section>
-      )}
-
-      {file && captions.length > 0 && (
-        <ExportPanel
-          file={file}
-          captions={captions}
-          highlightWords={settings.highlightWords}
-          onHighlightWordsChange={(highlightWords) => setSettings({ ...settings, highlightWords })}
-          disabled={busy}
-        />
-      )}
-
-      <details className="group rounded-2xl border border-zinc-200 dark:border-zinc-800">
-        <summary
-          data-testid="advanced"
-          className="flex cursor-pointer list-none items-center justify-between px-5 py-4 text-sm font-medium text-zinc-600 marker:content-none hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 [&::-webkit-details-marker]:hidden"
-        >
-          Advanced options
-          <svg viewBox="0 0 24 24" fill="none" className="h-4 w-4 transition group-open:rotate-180" aria-hidden="true">
-            <path d="m6 9 6 6 6-6" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-        </summary>
-        <div className="flex flex-col gap-5 border-t border-zinc-100 px-5 py-5 dark:border-zinc-900">
-          <label className="flex flex-col gap-1.5 text-sm">
-            <span className="font-medium">Language hints (optional)</span>
-            <input
-              className="rounded-lg border border-zinc-300 bg-transparent px-3 py-2 text-sm dark:border-zinc-700"
-              value={settings.languages}
-              onChange={(e) => setSettings({ ...settings, languages: e.target.value })}
-              placeholder="te-IN,en-IN"
-            />
-            <span className="text-xs text-zinc-500">Comma-separated BCP-47 codes. Leave empty to auto-detect.</span>
-          </label>
-
-          <label className="flex flex-col gap-1.5 text-sm">
-            <span className="font-medium">Extraction engine</span>
-            <select
-              className="rounded-lg border border-zinc-300 bg-transparent px-3 py-2 text-sm dark:border-zinc-700"
-              value={settings.engine}
-              onChange={(e) => setSettings({ ...settings, engine: e.target.value as Settings["engine"] })}
-            >
-              <option value="auto">Auto (Mediabunny, fallback ffmpeg)</option>
-              <option value="mediabunny">Mediabunny only</option>
-              <option value="ffmpeg">ffmpeg.wasm only</option>
-            </select>
-          </label>
-
-          <div className="flex flex-col gap-3 text-sm">
-            <label className="flex items-start gap-2">
-              <input
-                type="checkbox"
-                className="mt-0.5"
-                checked={settings.smartSpelling}
-                onChange={(e) => setSettings({ ...settings, smartSpelling: e.target.checked })}
-              />
-              <span>
-                <span className="font-medium">Smart spelling</span>
-                <span className="block text-xs text-zinc-500">
-                  After transcribing, a quick Gemini pass writes every word in natural English letters and fixes
-                  English words written in another script (టాపిక్ → topic, एलएलएम → LLMs). Timings don&apos;t
-                  change. Turn off to compare with the basic spelling.
-                </span>
-              </span>
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="font-medium">Glossary (optional)</span>
-              <textarea
-                rows={2}
-                className="rounded-lg border border-zinc-300 bg-transparent px-3 py-2 text-sm dark:border-zinc-700"
-                value={settings.glossary}
-                onChange={(e) => setSettings({ ...settings, glossary: e.target.value })}
-                placeholder="LLMs, Kubernetes, Neeharika"
-              />
-              <span className="text-xs text-zinc-500">
-                Names and technical terms to spell exactly like this. Comma or newline separated.
-              </span>
-            </label>
-            {words.length > 0 && (
+          {file &&
+            (busy ? (
               <button
                 type="button"
-                disabled={busy || spellStatus.step === "running" || !settings.smartSpelling || !hasForeign}
-                onClick={() => void runSpelling(words)}
-                className="w-fit text-sm underline disabled:opacity-40"
+                onClick={() => abortRef.current?.abort()}
+                className="w-full rounded-full border border-zinc-300 px-5 py-2.5 text-sm font-medium transition hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-900"
               >
-                Re-check spelling with this glossary
+                Cancel
               </button>
-            )}
-          </div>
-
-          {extract && audioUrl && (
-            <div className="flex flex-col gap-1.5 text-sm">
-              <span className="font-medium">
-                Extracted audio ({extract.engine}, {mb(extract.audio.size)})
-              </span>
-              <audio src={audioUrl} controls className="w-full" />
-              <a href={audioUrl} download={`${file?.name ?? "audio"}.ogg`} className="w-fit text-xs underline">
-                Download .ogg
-              </a>
-            </div>
-          )}
-
-          {result && (
-            <button type="button" className="w-fit text-sm underline" onClick={downloadWords}>
-              Download words JSON
-            </button>
-          )}
-
-          {words.length > 0 && (
-            <div className="flex flex-col gap-2">
-              <span className="text-sm font-medium">Word timings ({words.length})</span>
-              <div className="flex max-h-72 flex-wrap gap-1 overflow-auto" data-testid="words">
-                {displayWords.map((w, i) => (
+            ) : (
+              <button
+                type="button"
+                onClick={run}
+                className="w-full rounded-full bg-zinc-900 px-5 py-2.5 text-sm font-medium text-white transition hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+              >
+                {status.step === "done" ? "Redo captions" : "Make captions"}
+              </button>
+            ))}
+          <SpellStatusLine status={spellStatus} />
+          {captions.length === 0 ? (
+            <p className="rounded-xl border border-dashed border-zinc-200 p-4 text-sm text-zinc-500 dark:border-zinc-800">
+              {file ? "Your captions will appear here once you make them." : "Choose a video to get started."}
+            </p>
+          ) : (
+            <ol className="flex flex-col gap-1" data-testid="captions">
+              {captions.map((c) => (
+                <li key={c.id}>
                   <button
                     type="button"
-                    key={i}
-                    onClick={() => seek(w.start)}
-                    title={`${w.start.toFixed(2)}–${w.end.toFixed(2)} s${w.speaker ? ` · ${w.speaker}` : ""}`}
-                    className={`rounded px-1.5 py-0.5 text-sm ${
-                      i === activeIndex ? "bg-amber-300 text-black" : "bg-zinc-100 dark:bg-zinc-900"
-                    }`}
+                    onClick={() => seek(c.start)}
+                    className="flex w-full items-start gap-3 rounded-lg px-3 py-2 text-left text-sm transition hover:bg-zinc-100 dark:hover:bg-zinc-900"
                   >
-                    {w.text}
-                    <span className="ml-1 text-[10px] text-zinc-500">{w.start.toFixed(1)}</span>
+                    <span className="mt-0.5 shrink-0 font-mono text-xs tabular-nums text-zinc-400">{clock(c.start)}</span>
+                    <span>{c.lines?.join(" ") ?? c.text}</span>
                   </button>
-                ))}
-              </div>
+                </li>
+              ))}
+            </ol>
+          )}
+        </aside>
+
+        {/* Preview */}
+        <main className="order-1 flex min-h-0 flex-col gap-3 p-4 lg:order-2">
+          {status.step !== "idle" && (
+            <div className="flex flex-col gap-2.5" data-testid="progress">
+              {status.step !== "done" && status.step !== "error" && (
+                <ProgressBar value={status.step === "transcribing" ? undefined : status.progress} />
+              )}
+              <StatusLine status={status} elapsedSec={elapsedSec} />
             </div>
           )}
 
-          <div className="flex flex-col gap-1.5">
-            <span className="text-sm font-medium">Log</span>
-            <ol
-              className="max-h-40 overflow-auto rounded-lg bg-zinc-100 p-3 font-mono text-xs text-zinc-600 dark:bg-zinc-900 dark:text-zinc-400"
-              data-testid="log"
-            >
-              {log.map((l, i) => (
-                <li key={i}>{l}</li>
-              ))}
-            </ol>
+          {file && videoUrl ? (
+            <>
+              <CaptionPlayer
+                className="min-h-0 flex-1"
+                src={videoUrl}
+                captions={captions}
+                language={language}
+                style={settings.style}
+                videoRef={videoRef}
+              />
+              <Timeline videoRef={videoRef} captions={captions} />
+            </>
+          ) : (
+            <DropZone dragOver={dragOver} onDragOver={setDragOver} onDrop={onDrop} onPick={() => fileInputRef.current?.click()} />
+          )}
+        </main>
+
+        {/* Inspector */}
+        <aside className="order-3 flex min-h-0 flex-col border-t border-zinc-200 lg:border-t-0 lg:border-l dark:border-zinc-800">
+          <div role="tablist" className="flex shrink-0 gap-1 border-b border-zinc-200 p-2 dark:border-zinc-800">
+            <TabButton active={tab === "style"} onClick={() => setTab("style")}>
+              Style
+            </TabButton>
+            <TabButton testId="advanced" active={tab === "settings"} onClick={() => setTab("settings")}>
+              Settings
+            </TabButton>
           </div>
-        </div>
-      </details>
+
+          <div className={`${tab === "style" ? "flex" : "hidden"} min-h-0 flex-1 flex-col overflow-y-auto`}>
+            <StylePicker style={settings.style} onChange={(style) => setSettings({ ...settings, style })} />
+          </div>
+
+          <div className={`${tab === "settings" ? "flex" : "hidden"} min-h-0 flex-1 flex-col gap-5 overflow-y-auto p-4 text-sm`}>
+            <label className="flex flex-col gap-1.5">
+              <span className="font-medium">Language hints (optional)</span>
+              <input
+                className="rounded-lg border border-zinc-300 bg-transparent px-3 py-2 dark:border-zinc-700"
+                value={settings.languages}
+                onChange={(e) => setSettings({ ...settings, languages: e.target.value })}
+                placeholder="te-IN,en-IN"
+              />
+              <span className="text-xs text-zinc-500">Comma-separated BCP-47 codes. Leave empty to auto-detect.</span>
+            </label>
+
+            <label className="flex flex-col gap-1.5">
+              <span className="font-medium">Extraction engine</span>
+              <select
+                className="rounded-lg border border-zinc-300 bg-transparent px-3 py-2 dark:border-zinc-700"
+                value={settings.engine}
+                onChange={(e) => setSettings({ ...settings, engine: e.target.value as Settings["engine"] })}
+              >
+                <option value="auto">Auto (Mediabunny, fallback ffmpeg)</option>
+                <option value="mediabunny">Mediabunny only</option>
+                <option value="ffmpeg">ffmpeg.wasm only</option>
+              </select>
+            </label>
+
+            <div className="flex flex-col gap-3">
+              <label className="flex items-start gap-2">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={settings.smartSpelling}
+                  onChange={(e) => setSettings({ ...settings, smartSpelling: e.target.checked })}
+                />
+                <span>
+                  <span className="font-medium">Smart spelling</span>
+                  <span className="block text-xs text-zinc-500">
+                    After transcribing, a quick Gemini pass writes every word in natural English letters and fixes
+                    English words written in another script (టాపిక్ → topic, एलएलएम → LLMs). Timings don&apos;t change.
+                  </span>
+                </span>
+              </label>
+              <label className="flex flex-col gap-1.5">
+                <span className="font-medium">Glossary (optional)</span>
+                <textarea
+                  rows={2}
+                  className="rounded-lg border border-zinc-300 bg-transparent px-3 py-2 dark:border-zinc-700"
+                  value={settings.glossary}
+                  onChange={(e) => setSettings({ ...settings, glossary: e.target.value })}
+                  placeholder="LLMs, Kubernetes, Neeharika"
+                />
+                <span className="text-xs text-zinc-500">
+                  Names and technical terms to spell exactly like this. Comma or newline separated.
+                </span>
+              </label>
+              {words.length > 0 && (
+                <button
+                  type="button"
+                  disabled={busy || spellStatus.step === "running" || !settings.smartSpelling || !hasForeign}
+                  onClick={() => void runSpelling(words)}
+                  className="w-fit underline disabled:opacity-40"
+                >
+                  Re-check spelling with this glossary
+                </button>
+              )}
+            </div>
+
+            {extract && audioUrl && (
+              <div className="flex flex-col gap-1.5">
+                <span className="font-medium">
+                  Extracted audio ({extract.engine}, {mb(extract.audio.size)})
+                </span>
+                <audio src={audioUrl} controls className="w-full" />
+                <a href={audioUrl} download={`${file?.name ?? "audio"}.ogg`} className="w-fit text-xs underline">
+                  Download .ogg
+                </a>
+              </div>
+            )}
+
+            {result && (
+              <button type="button" className="w-fit underline" onClick={downloadWords}>
+                Download words JSON
+              </button>
+            )}
+
+            {words.length > 0 && (
+              <div className="flex flex-col gap-2">
+                <span className="font-medium">Word timings ({words.length})</span>
+                <div className="flex max-h-72 flex-wrap gap-1 overflow-auto" data-testid="words">
+                  {displayWords.map((w, i) => (
+                    <button
+                      type="button"
+                      key={i}
+                      onClick={() => seek(w.start)}
+                      title={`${w.start.toFixed(2)}–${w.end.toFixed(2)} s${w.speaker ? ` · ${w.speaker}` : ""}`}
+                      className={`rounded px-1.5 py-0.5 ${
+                        i === activeIndex ? "bg-amber-300 text-black" : "bg-zinc-100 dark:bg-zinc-900"
+                      }`}
+                    >
+                      {w.text}
+                      <span className="ml-1 text-[10px] text-zinc-500">{w.start.toFixed(1)}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="flex flex-col gap-1.5">
+              <span className="font-medium">Log</span>
+              <ol
+                className="max-h-40 overflow-auto rounded-lg bg-zinc-100 p-3 font-mono text-xs text-zinc-600 dark:bg-zinc-900 dark:text-zinc-400"
+                data-testid="log"
+              >
+                {log.map((l, i) => (
+                  <li key={i}>{l}</li>
+                ))}
+              </ol>
+            </div>
+          </div>
+        </aside>
+      </div>
     </div>
+  );
+}
+
+function DropZone({
+  dragOver,
+  onDragOver,
+  onDrop,
+  onPick,
+}: {
+  dragOver: boolean;
+  onDragOver: (over: boolean) => void;
+  onDrop: (e: DragEvent) => void;
+  onPick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onPick}
+      onDragOver={(e) => {
+        e.preventDefault();
+        onDragOver(true);
+      }}
+      onDragLeave={() => onDragOver(false)}
+      onDrop={onDrop}
+      className={`flex min-h-64 flex-1 flex-col items-center justify-center gap-3 rounded-2xl border-2 border-dashed px-6 text-center transition ${
+        dragOver
+          ? "border-zinc-900 bg-zinc-100 dark:border-zinc-100 dark:bg-zinc-900"
+          : "border-zinc-300 hover:border-zinc-400 hover:bg-zinc-100/60 dark:border-zinc-700 dark:hover:bg-zinc-900/60"
+      }`}
+    >
+      <span className="flex h-12 w-12 items-center justify-center rounded-full bg-white shadow-sm dark:bg-zinc-900">
+        <svg viewBox="0 0 24 24" fill="none" className="h-6 w-6 text-zinc-500" aria-hidden="true">
+          <path
+            d="M12 16V4m0 0L8 8m4-4 4 4M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"
+            stroke="currentColor"
+            strokeWidth="1.75"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      </span>
+      <span className="text-lg font-medium">Drop a video here, or click to choose</span>
+      <span className="text-sm text-zinc-500">MP4, MOV, MKV, WebM, AVI — up to 10 minutes</span>
+    </button>
+  );
+}
+
+function TabButton({
+  active,
+  onClick,
+  children,
+  testId,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: ReactNode;
+  testId?: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={active}
+      onClick={onClick}
+      data-testid={testId}
+      className={`flex-1 rounded-lg px-3 py-1.5 text-sm font-medium transition ${
+        active
+          ? "bg-zinc-100 text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100"
+          : "text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
+      }`}
+    >
+      {children}
+    </button>
   );
 }
 

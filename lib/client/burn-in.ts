@@ -6,13 +6,14 @@
  * that frame's timestamp on a canvas, and it re-encodes (hardware where
  * available). Audio is copied unchanged when the container allows it.
  */
+import type { CaptionStyle } from "../caption-style";
 import type { Caption } from "../types";
 import { drawCaption, findCaptionAt, spokenWordAt } from "./caption-renderer";
 import type { SaveTarget } from "./save-file";
 
 export type BurnInOptions = {
-  /** Colour the word being spoken (karaoke style). */
-  highlightWords?: boolean;
+  /** Look of the burned-in captions; also drives the browser preview. */
+  style: CaptionStyle;
   onProgress?: (fraction: number) => void;
   signal?: AbortSignal;
 };
@@ -27,7 +28,7 @@ export async function burnInCaptions(
   file: File,
   captions: Caption[],
   target: SaveTarget,
-  opts: BurnInOptions = {},
+  opts: BurnInOptions,
 ): Promise<BurnInResult> {
   const mb = await import("mediabunny");
   const sorted = [...captions].sort((a, b) => a.start - b.start);
@@ -76,8 +77,8 @@ export async function burnInCaptions(
           const i = findCaptionAt(sorted, sample.timestamp);
           if (i >= 0) {
             const t = sample.timestamp;
-            const word = opts.highlightWords ? spokenWordAt(sorted[i], t) : -1;
-            drawCaption(ctx, sorted[i], canvas.width, canvas.height, word);
+            const word = opts.style.emphasis === "highlight" ? spokenWordAt(sorted[i], t) : -1;
+            drawCaption(ctx, sorted[i], canvas.width, canvas.height, opts.style, word);
           }
           return canvas;
         },
