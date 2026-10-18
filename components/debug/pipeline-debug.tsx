@@ -114,25 +114,37 @@ export function PipelineDebug() {
       }),
     [words, spelled, settings.script],
   );
-  /** User edits, per cue id. Cleared whenever the captions are rebuilt. */
+  /** User text edits, per cue id. Cleared whenever the captions are rebuilt. */
   const [captionEdits, setCaptionEdits] = useState<Record<string, string>>({});
+  /** User timing overrides, per cue id, set by dragging on the timeline. */
+  const [captionTimings, setCaptionTimings] = useState<Record<string, { start: number; end: number }>>({});
+  const [selectedCaptionId, setSelectedCaptionId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   // Caption cues on the video timeline, built from the word timings.
   const baseCaptions = useMemo(() => groupWords(displayWords), [displayWords]);
-  // User edits win over the derived text, and are re-wrapped to keep the layout.
+  // Text and timing edits win over the derived cues; edited text is re-wrapped
+  // to keep the two-line layout. Dragging clamps cues between their neighbours,
+  // so the list stays sorted for `findCaptionAt`.
   const captions = useMemo(
     () =>
       baseCaptions.map((c) => {
+        const timing = captionTimings[c.id];
         const edited = captionEdits[c.id];
-        if (edited === undefined || edited === c.text) return c;
-        return {
-          ...c,
-          text: edited,
-          lines: wrapLines(edited, DEFAULT_GROUP_OPTIONS.maxCharsPerLine, DEFAULT_GROUP_OPTIONS.maxLines),
-        };
+        const hasText = edited !== undefined && edited !== c.text;
+        if (!timing && !hasText) return c;
+        const next = { ...c };
+        if (timing) {
+          next.start = timing.start;
+          next.end = timing.end;
+        }
+        if (edited !== undefined && edited !== c.text) {
+          next.text = edited;
+          next.lines = wrapLines(edited, DEFAULT_GROUP_OPTIONS.maxCharsPerLine, DEFAULT_GROUP_OPTIONS.maxLines);
+        }
+        return next;
       }),
-    [baseCaptions, captionEdits],
+    [baseCaptions, captionEdits, captionTimings],
   );
   const romanized = settings.script === "roman" && hasForeign;
   const language = romanized ? undefined : settings.languages.split(",")[0]?.trim() || undefined;
@@ -245,6 +257,8 @@ export function PipelineDebug() {
     setSpelled(null);
     setSpellStatus({ step: "idle" });
     setCaptionEdits({});
+    setCaptionTimings({});
+    setSelectedCaptionId(null);
     setEditingId(null);
     setFile(f);
     setVideoUrl(f ? URL.createObjectURL(f) : null);
@@ -266,6 +280,8 @@ export function PipelineDebug() {
     setSpelled(null);
     setSpellStatus({ step: "idle" });
     setCaptionEdits({});
+    setCaptionTimings({});
+    setSelectedCaptionId(null);
     setEditingId(null);
     try {
       // 1. Extract
@@ -350,6 +366,21 @@ export function PipelineDebug() {
     });
   };
 
+  /** Move/resize a cue from the timeline; neighbours were already respected. */
+  const retimeCaption = useCallback((id: string, start: number, end: number) => {
+    setCaptionTimings((prev) => ({ ...prev, [id]: { start, end } }));
+  }, []);
+
+  /** Drop a cue's timing override, restoring the word-derived times. */
+  const resetCaptionTiming = useCallback((id: string) => {
+    setCaptionTimings((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }, []);
+
   const onDrop = (e: DragEvent) => {
     e.preventDefault();
     setDragOver(false);
@@ -430,24 +461,72 @@ export function PipelineDebug() {
               </button>
             ))}
           <SpellStatusLine status={spellStatus} />
+          {captions.length > 0 && (
+            <p className="text-xs text-zinc-400">Click a caption to edit it · click the time to jump.</p>
+          )}
           {captions.length === 0 ? (
             <p className="rounded-xl border border-dashed border-zinc-200 p-4 text-sm text-zinc-500 dark:border-zinc-800">
               {file ? "Your captions will appear here once you make them." : "Choose a video to get started."}
             </p>
           ) : (
             <ol className="flex flex-col gap-1" data-testid="captions">
-              {captions.map((c) => (
-                <li key={c.id}>
-                  <button
-                    type="button"
-                    onClick={() => seek(c.start)}
-                    className="flex w-full items-start gap-3 rounded-lg px-3 py-2 text-left text-sm transition hover:bg-zinc-100 dark:hover:bg-zinc-900"
-                  >
-                    <span className="mt-0.5 shrink-0 font-mono text-xs tabular-nums text-zinc-400">{clock(c.start)}</span>
-                    <span>{c.lines?.join(" ") ?? c.text}</span>
-                  </button>
-                </li>
-              ))}
+              {captions.map((c) => {
+                const text = c.lines?.join(" ") ?? c.text;
+                const edited = captionEdits[c.id] !== undefined;
+                return (
+                  <li key={c.id}>
+                    <div
+                      className={`flex items-start gap-2 rounded-lg px-2 py-1.5 transition hover:bg-zinc-100 dark:hover:bg-zinc-900 ${
+                        selectedCaptionId === c.id ? "bg-amber-50 dark:bg-amber-500/10" : ""
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedCaptionId(c.id);
+                          seek(c.start);
+                        }}
+                        title="Jump to this caption"
+                        className="mt-0.5 shrink-0 rounded px-1 font-mono text-xs tabular-nums text-zinc-400 transition hover:text-zinc-900 dark:hover:text-zinc-100"
+                      >
+                        {clock(c.start)}
+                      </button>
+                      {editingId === c.id ? (
+                        <textarea
+                          autoFocus
+                          rows={2}
+                          value={draft}
+                          onChange={(e) => setDraft(e.target.value)}
+                          onBlur={() => commitEdit(c.id, draft)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && !e.shiftKey) {
+                              e.preventDefault();
+                              commitEdit(c.id, draft);
+                            } else if (e.key === "Escape") {
+                              setEditingId(null);
+                            }
+                          }}
+                          className="w-full resize-none rounded-lg border border-zinc-300 bg-transparent px-2 py-1 text-sm dark:border-zinc-700"
+                        />
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => startEdit(c.id, text)}
+                          title="Click to edit"
+                          className="w-full rounded-lg px-2 py-0.5 text-left text-sm"
+                        >
+                          {text}
+                          {edited && (
+                            <span className="ml-2 text-[10px] font-medium tracking-wide text-amber-600 uppercase dark:text-amber-400">
+                              edited
+                            </span>
+                          )}
+                        </button>
+                      )}
+                    </div>
+                  </li>
+                );
+              })}
             </ol>
           )}
         </aside>
@@ -473,7 +552,14 @@ export function PipelineDebug() {
                 style={settings.style}
                 videoRef={videoRef}
               />
-              <Timeline videoRef={videoRef} captions={captions} />
+              <Timeline
+                videoRef={videoRef}
+                captions={captions}
+                selectedId={selectedCaptionId}
+                onSelect={setSelectedCaptionId}
+                onRetime={retimeCaption}
+                onReset={resetCaptionTiming}
+              />
             </>
           ) : (
             <DropZone dragOver={dragOver} onDragOver={setDragOver} onDrop={onDrop} onPick={() => fileInputRef.current?.click()} />

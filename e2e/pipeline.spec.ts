@@ -107,6 +107,58 @@ test("captions are grouped and downloadable as SRT", async ({ page }) => {
   expect(text).toContain("Hello everyone.");
 });
 
+test("captions can be edited, and the edit flows to the export", async ({ page }) => {
+  await mockApi(page);
+  await runPipeline(page, "speech.mp4");
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+
+  await page.getByTestId("captions").getByRole("button", { name: /Hello everyone/ }).click();
+  const box = page.getByTestId("captions").locator("textarea");
+  await box.fill("Hi all.");
+  await box.press("Enter");
+
+  await expect(page.getByTestId("captions")).toContainText("Hi all.");
+  await expect(page.getByTestId("captions")).toContainText("edited");
+
+  const dl = page.waitForEvent("download");
+  await page.getByTestId("export-menu").click();
+  await page.getByRole("button", { name: "Download .srt" }).click();
+  const text = (await import("node:fs")).readFileSync(await (await dl).path(), "utf8");
+  expect(text).toContain("Hi all.");
+  expect(text).not.toContain("Hello everyone.");
+});
+
+test("a caption can be retimed on the timeline and the new time is exported", async ({ page }) => {
+  await mockApi(page);
+  await runPipeline(page, "speech.mp4");
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+
+  // Select the cue on the timeline, then nudge it 0.1 s later.
+  const segment = page.getByTestId("timeline").getByRole("button", { name: /Hello everyone/ });
+  await segment.click();
+  await expect(page.getByTestId("timeline-selected")).toContainText("0:00.20");
+  await page.getByRole("button", { name: /^0\.1s/ }).click();
+  await expect(page.getByTestId("timeline-selected")).toContainText("0:00.30");
+
+  // Dragging the segment moves it in time too.
+  const box = await segment.boundingBox();
+  await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box!.x + box!.width / 2 + 60, box!.y + box!.height / 2, { steps: 6 });
+  await page.mouse.up();
+  await expect(page.getByTestId("timeline-selected")).not.toContainText("0:00.30");
+
+  const dl = page.waitForEvent("download");
+  await page.getByTestId("export-menu").click();
+  await page.getByRole("button", { name: "Download .srt" }).click();
+  const text = (await import("node:fs")).readFileSync(await (await dl).path(), "utf8");
+  // The dragged time is what gets exported (later than the 0.3 s nudge).
+  const start = /(\d\d):(\d\d):(\d\d),(\d\d\d) -->/.exec(text);
+  expect(start).not.toBeNull();
+  const startSec = Number(start![1]) * 3600 + Number(start![2]) * 60 + Number(start![3]) + Number(start![4]) / 1000;
+  expect(startSec).toBeGreaterThan(0.3);
+});
+
 test("AVI falls back to ffmpeg.wasm", async ({ page }) => {
   const captured = await mockApi(page);
   await runPipeline(page, "speech.avi");
