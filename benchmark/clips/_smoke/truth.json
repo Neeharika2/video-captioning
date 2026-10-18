@@ -1,0 +1,6 @@
+{
+  "text": "Hello everyone. Today we deploy the service to Kubernetes, then query the logs in BigQuery. The rollout should take about ten minutes.",
+  "glossary": ["Kubernetes", "BigQuery"],
+  "languageCodes": ["en-US"],
+  "notes": "Synthetic flite voice. Plumbing smoke test only — not a real benchmark clip."
+}

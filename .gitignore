@@ -1,0 +1,52 @@
+# See https://help.github.com/articles/ignoring-files for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+*.log
+
+# env files (can opt-in for committing if needed)
+.env*
+!.env.example
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# benchmark: private audio, cache and raw results
+/benchmark/.cache/
+/benchmark/results/
+/benchmark/clips/*/*
+!/benchmark/clips/*/truth.json
+!/benchmark/clips/_smoke/audio.wav
+
+# ffmpeg.wasm core, copied from node_modules on install (postinstall)
+/public/ffmpeg/
+
+# e2e
+/e2e/.fixtures/
+/test-results/
+/playwright-report/
