@@ -1,9 +1,29 @@
 "use client";
 
-import { type CSSProperties, type RefObject, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { fontStack, fontSizeFor, type CaptionStyle } from "@/lib/caption-style";
+import {
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+  type RefObject,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+import {
+  ANIMATION_SECONDS,
+  captionEnter,
+  fontStack,
+  fontSizeFor,
+  styleForCaption,
+  type CaptionPlacement,
+  type CaptionPosition,
+  type CaptionStyle,
+} from "@/lib/caption-style";
 import { findCaptionAt, spokenWordAt } from "@/lib/client/caption-renderer";
 import type { Caption } from "@/lib/types";
+
+/** Placeholder shown only when there are no captions on screen and the video is paused. */
+const SAMPLE_TEXT = "Sample caption";
 
 type Props = {
   src: string;
@@ -14,6 +34,13 @@ type Props = {
   videoRef: RefObject<HTMLVideoElement | null>;
   /** Extra classes for the outer column (usually sizing from the workspace). */
   className?: string;
+  /** Let the caption be dragged to place it, and show a sample when nothing is on screen. */
+  interactive?: boolean;
+  /**
+   * New placement from dragging. `id` is the caption being moved, or `null`
+   * when the default (no caption on screen) is being positioned.
+   */
+  onPlacement?: (id: string | null, placement: CaptionPlacement) => void;
 };
 
 /**
@@ -21,15 +48,42 @@ type Props = {
  *
  * The stage is sized to the video's own aspect ratio (read from the file, not
  * assumed), so nothing is letterboxed and the overlay covers exactly the frame —
- * the same area the burned-in export draws on.
+ * the same area the burned-in export draws on. Each caption can be dragged to
+ * its own spot; placement and the appearance animation match the export.
  */
-export function CaptionPlayer({ src, captions, language, style, videoRef, className }: Props) {
+export function CaptionPlayer({
+  src,
+  captions,
+  language,
+  style,
+  videoRef,
+  className,
+  interactive = false,
+  onPlacement,
+}: Props) {
   const stageRef = useRef<HTMLDivElement>(null);
+  const blockRef = useRef<HTMLDivElement>(null);
   const trackRef = useRef<TextTrack | null>(null);
-  const [pos, setPos] = useState({ cue: -1, word: -1 });
+  const dragRef = useRef<{
+    id: string | null;
+    position: CaptionPosition;
+    x0: number;
+    y0: number;
+    ox: number;
+    oy: number;
+    w: number;
+    h: number;
+  } | null>(null);
+  const placementRef = useRef(onPlacement);
+  const [pos, setPos] = useState({ cue: -1, word: -1, age: Infinity, sample: false });
   const [box, setBox] = useState({ w: 0, h: 0 });
   const [ratio, setRatio] = useState(16 / 9);
+  const [dragging, setDragging] = useState(false);
   const emphasize = style.emphasis === "highlight";
+
+  useEffect(() => {
+    placementRef.current = onPlacement;
+  }, [onPlacement]);
 
   // Measure the available preview area so the stage can be fitted into it.
   useLayoutEffect(() => {
@@ -68,7 +122,8 @@ export function CaptionPlayer({ src, captions, language, style, videoRef, classN
     };
   }, [videoRef, src]);
 
-  // Follow playback. Re-render only when the visible cue or spoken word changes.
+  // Follow playback. Re-render when the visible cue, spoken word, appearance
+  // animation, or the on-screen sample changes.
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -77,7 +132,18 @@ export function CaptionPlayer({ src, captions, language, style, videoRef, classN
       const t = video.currentTime;
       const cue = findCaptionAt(captions, t);
       const word = emphasize && cue >= 0 ? spokenWordAt(captions[cue], t) : -1;
-      setPos((prev) => (prev.cue === cue && prev.word === word ? prev : { cue, word }));
+      // Animate only while playing: pausing or seeking shows the resting look
+      // (and makes the caption easy to grab and drag).
+      const raw = cue >= 0 && !video.paused ? t - captions[cue].start : Infinity;
+      const age = raw < ANIMATION_SECONDS ? raw : Infinity;
+      // Only offer the placement sample before the first cue (or with no
+      // captions at all) — never inside a gap, which would look like a real cue.
+      const sample = video.paused && cue < 0 && (captions.length === 0 || t < captions[0].start);
+      setPos((prev) =>
+        prev.cue === cue && prev.word === word && prev.age === age && prev.sample === sample
+          ? prev
+          : { cue, word, age, sample },
+      );
     };
     const loop = () => {
       update();
@@ -89,11 +155,13 @@ export function CaptionPlayer({ src, captions, language, style, videoRef, classN
     };
     const events = ["seeked", "seeking", "loadedmetadata", "timeupdate"] as const;
     video.addEventListener("play", start);
+    video.addEventListener("pause", update);
     for (const e of events) video.addEventListener(e, update);
     raf = requestAnimationFrame(loop);
     return () => {
       cancelAnimationFrame(raf);
       video.removeEventListener("play", start);
+      video.removeEventListener("pause", update);
       for (const e of events) video.removeEventListener(e, update);
     };
   }, [videoRef, src, captions, emphasize]);
@@ -126,8 +194,46 @@ export function CaptionPlayer({ src, captions, language, style, videoRef, classN
     };
   }, [videoRef, captions, language]);
 
+  // Drag to place the caption, on window so the pointer can leave the stage.
+  useEffect(() => {
+    if (!dragging) return;
+    const onMove = (e: PointerEvent) => {
+      const d = dragRef.current;
+      const change = placementRef.current;
+      if (!d || !change) return;
+      const stageW = Math.max(0, Math.min(box.w, box.h * ratio));
+      const stageH = ratio > 0 ? stageW / ratio : 0;
+      if (!stageW || !stageH) return;
+      const next = clampOffsets(
+        (e.clientX - d.x0) / stageW + d.ox,
+        (e.clientY - d.y0) / stageH + d.oy,
+        d.w,
+        d.h,
+        stageW,
+        stageH,
+        d.position,
+      );
+      change(d.id, { position: d.position, offsetX: round(next.x, 4), offsetY: round(next.y, 4) });
+    };
+    const onUp = () => {
+      dragRef.current = null;
+      setDragging(false);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+  }, [dragging, box.w, box.h, ratio]);
+
   const cue = pos.cue >= 0 ? captions[pos.cue] : undefined;
   const lines = cue ? (cue.lines?.length ? cue.lines : [cue.text]) : [];
+  const showGhost = !cue && interactive && pos.sample;
+  // This cue's own placement, or the style's default.
+  const effStyle = styleForCaption(style, cue?.placement);
   const tokens = lines.map((l) => l.split(/\s+/).filter(Boolean));
   const canHighlight = emphasize && !!cue && pos.word >= 0 && tokens.flat().length === cue.words.length;
   // Index of each line's first word within the cue.
@@ -139,7 +245,9 @@ export function CaptionPlayer({ src, captions, language, style, videoRef, classN
   const stageH = ratio > 0 ? stageW / ratio : 0;
   const fontSize = stageW ? fontSizeFor(style, stageW, stageH) : 16;
   const margin = Math.round(stageH * 0.07);
-  const alignItems = style.position === "top" ? "flex-start" : style.position === "middle" ? "center" : "flex-end";
+  const alignItems =
+    effStyle.position === "top" ? "flex-start" : effStyle.position === "middle" ? "center" : "flex-end";
+  const enter = cue ? captionEnter(style.animation, pos.age) : { opacity: 1, scale: 1, shiftY: 0 };
   const blockStyle: CSSProperties = {
     fontFamily: fontStack(style.fontFamily),
     fontSize,
@@ -147,7 +255,17 @@ export function CaptionPlayer({ src, captions, language, style, videoRef, classN
     lineHeight: 1.3,
     textAlign: "center",
     color: style.textColor,
+    transform: `translate(${effStyle.offsetX * stageW}px, ${effStyle.offsetY * stageH + enter.shiftY * stageH}px)${
+      enter.scale !== 1 ? ` scale(${enter.scale})` : ""
+    }`,
+    transformOrigin: "center",
+    opacity: enter.opacity,
+    pointerEvents: interactive ? "auto" : "none",
   };
+  if (interactive) {
+    blockStyle.cursor = dragging ? "grabbing" : "grab";
+    blockStyle.touchAction = "none";
+  }
   if (style.treatment === "box") {
     blockStyle.background = `rgba(0, 0, 0, ${style.boxOpacity})`;
     blockStyle.padding = `${Math.round(fontSize * 0.3)}px ${Math.round(fontSize * 0.5)}px`;
@@ -159,6 +277,29 @@ export function CaptionPlayer({ src, captions, language, style, videoRef, classN
     blockStyle.WebkitTextStrokeColor = "rgba(0, 0, 0, 0.9)";
     blockStyle.paintOrder = "stroke";
   }
+  if (showGhost) {
+    blockStyle.outline = "1px dashed rgba(255, 255, 255, 0.55)";
+    blockStyle.outlineOffset = 4;
+  }
+
+  const startDrag = (e: ReactPointerEvent) => {
+    const el = blockRef.current;
+    if (!onPlacement || !el) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const base = cue?.placement;
+    dragRef.current = {
+      id: cue?.id ?? null,
+      position: base?.position ?? style.position,
+      ox: base?.offsetX ?? style.offsetX,
+      oy: base?.offsetY ?? style.offsetY,
+      x0: e.clientX,
+      y0: e.clientY,
+      w: el.offsetWidth,
+      h: el.offsetHeight,
+    };
+    setDragging(true);
+  };
 
   const fullscreen = () => {
     const el = stageRef.current;
@@ -188,24 +329,34 @@ export function CaptionPlayer({ src, captions, language, style, videoRef, classN
         </button>
       </div>
 
-      <div
-        ref={stageRef}
-        className="flex min-h-0 flex-1 items-center justify-center [&:fullscreen]:bg-black"
-      >
+      <div ref={stageRef} className="flex min-h-0 flex-1 items-center justify-center [&:fullscreen]:bg-black">
         <div
           className="relative overflow-hidden rounded-lg bg-black shadow-sm [&:fullscreen]:rounded-none"
           style={stageW ? { width: stageW, height: stageH } : undefined}
         >
           <video ref={videoRef} src={src} controls playsInline className="h-full w-full" />
-          {cue && (
+          {(cue || showGhost) && (
             <div
               className="pointer-events-none absolute inset-0 flex justify-center px-[6%]"
               style={{ alignItems, paddingTop: margin, paddingBottom: margin }}
               data-testid="overlay"
               lang={language}
             >
-              <div style={blockStyle}>
-                {lines.map((line, i) => (
+              <div
+                ref={blockRef}
+                style={blockStyle}
+                data-caption-block
+                data-animation={style.animation}
+                data-offset-x={round(effStyle.offsetX, 4)}
+                data-offset-y={round(effStyle.offsetY, 4)}
+                onPointerDown={startDrag}
+              >
+                {showGhost && (
+                  <span className="pointer-events-none absolute -top-6 left-1/2 -translate-x-1/2 rounded-full bg-black/70 px-2 py-0.5 text-[10px] whitespace-nowrap text-white/80">
+                    Drag to position
+                  </span>
+                )}
+                {(showGhost ? [SAMPLE_TEXT] : lines).map((line, i) => (
                   <span key={i} className="block">
                     {canHighlight
                       ? tokens[i].map((tok, k) => (
@@ -227,4 +378,36 @@ export function CaptionPlayer({ src, captions, language, style, videoRef, classN
       </div>
     </div>
   );
+}
+
+/**
+ * Keep the block inside the frame while dragging, given its offset from the
+ * anchor. Mirrors the DOM layout (and canvas `blockTop`) so nothing escapes.
+ */
+function clampOffsets(
+  dx: number,
+  dy: number,
+  blockW: number,
+  blockH: number,
+  stageW: number,
+  stageH: number,
+  position: CaptionPosition,
+): { x: number; y: number } {
+  const marginPx = Math.round(stageH * 0.07);
+  const baseLeft = (stageW - blockW) / 2;
+  const baseTop =
+    position === "top" ? marginPx : position === "middle" ? (stageH - blockH) / 2 : stageH - marginPx - blockH;
+  return {
+    x: clamp(dx, -baseLeft / stageW, (stageW - blockW - baseLeft) / stageW),
+    y: clamp(dy, -baseTop / stageH, (stageH - blockH - baseTop) / stageH),
+  };
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return hi < lo ? (lo + hi) / 2 : Math.min(Math.max(v, lo), hi);
+}
+
+function round(v: number, digits: number): number {
+  const f = 10 ** digits;
+  return Math.round(v * f) / f;
 }

@@ -17,7 +17,7 @@ import { DEFAULT_GROUP_OPTIONS, groupWords, wrapLines } from "@/lib/group-words"
 import { hasNonLatinLetters, romanize } from "@/lib/romanize";
 import { latinPunctuation, parseGlossary, type SpelledWord } from "@/lib/spelling";
 import type { Word } from "@/lib/types";
-import { DEFAULT_STYLE, type CaptionStyle } from "@/lib/caption-style";
+import { DEFAULT_STYLE, type CaptionPlacement, type CaptionStyle } from "@/lib/caption-style";
 import { CaptionPlayer } from "./caption-player";
 import { ExportMenu } from "./export-menu";
 import { StylePicker } from "./style-picker";
@@ -118,6 +118,8 @@ export function PipelineDebug() {
   const [captionEdits, setCaptionEdits] = useState<Record<string, string>>({});
   /** User timing overrides, per cue id, set by dragging on the timeline. */
   const [captionTimings, setCaptionTimings] = useState<Record<string, { start: number; end: number }>>({});
+  /** Per-caption placement overrides, set by dragging a caption in the preview. */
+  const [captionPlacements, setCaptionPlacements] = useState<Record<string, CaptionPlacement>>({});
   const [selectedCaptionId, setSelectedCaptionId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -130,21 +132,23 @@ export function PipelineDebug() {
     () =>
       baseCaptions.map((c) => {
         const timing = captionTimings[c.id];
+        const placement = captionPlacements[c.id];
         const edited = captionEdits[c.id];
         const hasText = edited !== undefined && edited !== c.text;
-        if (!timing && !hasText) return c;
+        if (!timing && !placement && !hasText) return c;
         const next = { ...c };
         if (timing) {
           next.start = timing.start;
           next.end = timing.end;
         }
+        if (placement) next.placement = placement;
         if (edited !== undefined && edited !== c.text) {
           next.text = edited;
           next.lines = wrapLines(edited, DEFAULT_GROUP_OPTIONS.maxCharsPerLine, DEFAULT_GROUP_OPTIONS.maxLines);
         }
         return next;
       }),
-    [baseCaptions, captionEdits, captionTimings],
+    [baseCaptions, captionEdits, captionTimings, captionPlacements],
   );
   const romanized = settings.script === "roman" && hasForeign;
   const language = romanized ? undefined : settings.languages.split(",")[0]?.trim() || undefined;
@@ -258,6 +262,7 @@ export function PipelineDebug() {
     setSpellStatus({ step: "idle" });
     setCaptionEdits({});
     setCaptionTimings({});
+    setCaptionPlacements({});
     setSelectedCaptionId(null);
     setEditingId(null);
     setFile(f);
@@ -281,6 +286,7 @@ export function PipelineDebug() {
     setSpellStatus({ step: "idle" });
     setCaptionEdits({});
     setCaptionTimings({});
+    setCaptionPlacements({});
     setSelectedCaptionId(null);
     setEditingId(null);
     try {
@@ -381,6 +387,24 @@ export function PipelineDebug() {
     });
   }, []);
 
+  /** Place one caption, or the default when no caption is on screen. */
+  const placeCaption = useCallback((id: string | null, placement: CaptionPlacement) => {
+    if (id) {
+      setCaptionPlacements((prev) => ({ ...prev, [id]: placement }));
+      return;
+    }
+    setSettings((prev) => ({
+      ...prev,
+      style: { ...prev.style, offsetX: placement.offsetX, offsetY: placement.offsetY },
+    }));
+  }, []);
+
+  /** Clear every per-caption placement, and the default offset. */
+  const resetPlacements = useCallback(() => {
+    setCaptionPlacements({});
+    setSettings((prev) => ({ ...prev, style: { ...prev.style, offsetX: 0, offsetY: 0 } }));
+  }, []);
+
   const onDrop = (e: DragEvent) => {
     e.preventDefault();
     setDragOver(false);
@@ -473,6 +497,7 @@ export function PipelineDebug() {
               {captions.map((c) => {
                 const text = c.lines?.join(" ") ?? c.text;
                 const edited = captionEdits[c.id] !== undefined;
+                const moved = captionPlacements[c.id] !== undefined;
                 return (
                   <li key={c.id}>
                     <div
@@ -521,6 +546,14 @@ export function PipelineDebug() {
                               edited
                             </span>
                           )}
+                          {moved && (
+                            <span
+                              className="ml-2 text-[10px] font-medium tracking-wide text-sky-600 uppercase dark:text-sky-400"
+                              title="This caption has its own position"
+                            >
+                              moved
+                            </span>
+                          )}
                         </button>
                       )}
                     </div>
@@ -551,6 +584,8 @@ export function PipelineDebug() {
                 language={language}
                 style={settings.style}
                 videoRef={videoRef}
+                interactive={tab === "style"}
+                onPlacement={placeCaption}
               />
               <Timeline
                 videoRef={videoRef}
@@ -578,7 +613,12 @@ export function PipelineDebug() {
           </div>
 
           <div className={`${tab === "style" ? "flex" : "hidden"} min-h-0 flex-1 flex-col overflow-y-auto`}>
-            <StylePicker style={settings.style} onChange={(style) => setSettings({ ...settings, style })} />
+            <StylePicker
+              style={settings.style}
+              onChange={(style) => setSettings({ ...settings, style })}
+              hasPlacements={Object.keys(captionPlacements).length > 0}
+              onResetPlacements={resetPlacements}
+            />
           </div>
 
           <div className={`${tab === "settings" ? "flex" : "hidden"} min-h-0 flex-1 flex-col gap-5 overflow-y-auto p-4 text-sm`}>

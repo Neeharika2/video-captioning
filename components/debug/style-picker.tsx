@@ -2,9 +2,11 @@
 
 import { type CSSProperties, useState } from "react";
 import {
+  ANIMATION_LABELS,
   FONT_LABELS,
   PRESETS,
   sameStyle,
+  type CaptionAnimation,
   type CaptionPosition,
   type CaptionStyle,
   type CaptionTreatment,
@@ -15,6 +17,10 @@ import {
 type Props = {
   style: CaptionStyle;
   onChange: (style: CaptionStyle) => void;
+  /** True when at least one caption has its own placement. */
+  hasPlacements?: boolean;
+  /** Clear every per-caption placement (and the default offset). */
+  onResetPlacements?: () => void;
 };
 
 const TREATMENTS: { value: CaptionTreatment; label: string }[] = [
@@ -30,11 +36,16 @@ const POSITIONS: { value: CaptionPosition; label: string }[] = [
   { value: "bottom", label: "Bottom" },
 ];
 
+const ANIMATIONS: { value: CaptionAnimation; label: string }[] = (["none", "fade", "pop", "rise"] as const).map((value) => ({
+  value,
+  label: ANIMATION_LABELS[value],
+}));
+
 /**
  * Style inspector. Style lives apart from the transcript, so every change shows
  * up live in the preview (and in the burned-in export, which shares the style).
  */
-export function StylePicker({ style, onChange }: Props) {
+export function StylePicker({ style, onChange, hasPlacements = false, onResetPlacements }: Props) {
   const [copied, setCopied] = useState(false);
   const active = PRESETS.find((p) => sameStyle(p.style, style));
   const patch = (part: Partial<CaptionStyle>) => onChange({ ...style, ...part });
@@ -124,7 +135,33 @@ export function StylePicker({ style, onChange }: Props) {
 
         <div className="flex flex-col gap-1.5">
           <span className="font-medium">Position</span>
-          <Segmented value={style.position} options={POSITIONS} onChange={(position) => patch({ position })} />
+          <Segmented
+            value={style.position}
+            options={POSITIONS}
+            onChange={(position) => patch({ position, offsetX: 0, offsetY: 0 })}
+          />
+          <span className="text-xs text-zinc-500">
+            Drag a caption in the preview to give it its own spot — captions can sit in different places. This is
+            where captions you haven&apos;t moved start out.
+          </span>
+          {(style.offsetX !== 0 || style.offsetY !== 0 || hasPlacements) && (
+            <button
+              type="button"
+              onClick={() => {
+                patch({ offsetX: 0, offsetY: 0 });
+                onResetPlacements?.();
+              }}
+              className="self-start text-xs text-zinc-500 underline underline-offset-2 hover:text-zinc-900 dark:hover:text-zinc-100"
+            >
+              Reset all positions
+            </button>
+          )}
+        </div>
+
+        <div className="flex flex-col gap-1.5">
+          <span className="font-medium">Animation</span>
+          <Segmented value={style.animation} options={ANIMATIONS} onChange={(animation) => patch({ animation })} />
+          <span className="text-xs text-zinc-500">How the caption appears when it comes on screen.</span>
         </div>
 
         {style.treatment === "box" && (

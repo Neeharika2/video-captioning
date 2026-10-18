@@ -8,6 +8,8 @@ export type FontFamily = "sans" | "serif" | "mono";
 export type CaptionTreatment = "plain" | "shadow" | "outline" | "box";
 export type CaptionPosition = "top" | "middle" | "bottom";
 export type CaptionEmphasis = "none" | "highlight";
+/** How a caption comes on screen when its cue starts. */
+export type CaptionAnimation = "none" | "fade" | "pop" | "rise";
 
 export type CaptionStyle = {
   fontFamily: FontFamily;
@@ -21,8 +23,14 @@ export type CaptionStyle = {
   treatment: CaptionTreatment;
   /** Background opacity (0–1) when `treatment` is "box". */
   boxOpacity: number;
+  /** Anchor the block sits at; free dragging adds `offsetX`/`offsetY` on top. */
   position: CaptionPosition;
+  /** Free placement offset from the anchor, as a fraction of the frame size. */
+  offsetX: number;
+  offsetY: number;
   emphasis: CaptionEmphasis;
+  /** Appearance animation, played when the cue first shows. */
+  animation: CaptionAnimation;
 };
 
 /** Max share of the frame width a caption block may occupy. */
@@ -75,6 +83,59 @@ export function blockTop(style: CaptionStyle, height: number, blockHeight: numbe
   return height - margin - blockHeight;
 }
 
+export const ANIMATION_LABELS: Record<CaptionAnimation, string> = {
+  none: "None",
+  fade: "Fade",
+  pop: "Pop",
+  rise: "Rise",
+};
+
+/** How long an appearance animation runs (seconds). */
+export const ANIMATION_SECONDS = 0.28;
+
+export type CaptionEnter = {
+  /** 0–1; multiplied into the block's opacity. */
+  opacity: number;
+  /** Scale about the block's centre (1 = full size). */
+  scale: number;
+  /** Extra downward shift, as a fraction of the frame height. */
+  shiftY: number;
+};
+
+const ENTER_IDLE: CaptionEnter = { opacity: 1, scale: 1, shiftY: 0 };
+
+/**
+ * Appearance animation for a caption `ageSec` seconds after its cue started.
+ * Pure and shared by the DOM preview and the canvas burn-in, so they match.
+ * `Infinity` (or any age past the animation) returns the resting look.
+ */
+export function captionEnter(animation: CaptionAnimation, ageSec: number): CaptionEnter {
+  if (animation === "none" || !Number.isFinite(ageSec) || ageSec >= ANIMATION_SECONDS) return ENTER_IDLE;
+  const p = Math.max(0, Math.min(1, ageSec / ANIMATION_SECONDS));
+  const ease = 1 - Math.pow(1 - p, 3); // easeOutCubic
+  if (animation === "fade") return { opacity: ease, scale: 1, shiftY: 0 };
+  if (animation === "pop") {
+    // Overshoot just past full size, then settle — and fade in a touch faster.
+    return { opacity: Math.min(1, ease * 1.6), scale: 0.72 + 0.28 * ease + 0.06 * Math.sin(Math.PI * p), shiftY: 0 };
+  }
+  // "rise": slide up into place from a little below.
+  return { opacity: ease, scale: 1, shiftY: 0.06 * (1 - ease) };
+}
+
+/** A single caption's own placement, overriding the style's default anchor. */
+export type CaptionPlacement = {
+  position: CaptionPosition;
+  offsetX: number;
+  offsetY: number;
+};
+
+/** The style to draw a caption with: its own placement if it has one. */
+export function styleForCaption(style: CaptionStyle, placement?: CaptionPlacement): CaptionStyle {
+  return placement
+    ? { ...style, position: placement.position, offsetX: placement.offsetX, offsetY: placement.offsetY }
+    : style;
+}
+
 export type PresetId = "classic" | "modern-box" | "viral";
 
 export type Preset = {
@@ -98,7 +159,10 @@ export const PRESETS: Preset[] = [
       treatment: "shadow",
       boxOpacity: 0.55,
       position: "bottom",
+      offsetX: 0,
+      offsetY: 0,
       emphasis: "none",
+      animation: "fade",
     },
   },
   {
@@ -114,7 +178,10 @@ export const PRESETS: Preset[] = [
       treatment: "box",
       boxOpacity: 0.6,
       position: "bottom",
+      offsetX: 0,
+      offsetY: 0,
       emphasis: "none",
+      animation: "rise",
     },
   },
   {
@@ -130,7 +197,10 @@ export const PRESETS: Preset[] = [
       treatment: "shadow",
       boxOpacity: 0.55,
       position: "bottom",
+      offsetX: 0,
+      offsetY: 0,
       emphasis: "highlight",
+      animation: "pop",
     },
   },
 ];
@@ -148,6 +218,9 @@ export function sameStyle(a: CaptionStyle, b: CaptionStyle): boolean {
     a.treatment === b.treatment &&
     a.boxOpacity === b.boxOpacity &&
     a.position === b.position &&
-    a.emphasis === b.emphasis
+    a.offsetX === b.offsetX &&
+    a.offsetY === b.offsetY &&
+    a.emphasis === b.emphasis &&
+    a.animation === b.animation
   );
 }

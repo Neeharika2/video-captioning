@@ -6,7 +6,7 @@
  * fonts (see `fontStack`), so Telugu and other complex scripts shape correctly.
  */
 import type { Caption } from "../types";
-import { blockTop, cssFont, fontSizeFor, type CaptionStyle, CAPTION_MAX_WIDTH } from "../caption-style";
+import { blockTop, captionEnter, cssFont, fontSizeFor, type CaptionStyle, CAPTION_MAX_WIDTH } from "../caption-style";
 
 type Ctx = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 
@@ -59,6 +59,8 @@ function roundedRect(ctx: Ctx, x: number, y: number, w: number, h: number, r: nu
 /**
  * Draw `caption` onto a `width`×`height` frame using `style`. The active word
  * (index into `caption.words`) is coloured when the style highlights words.
+ * `ageSec` is how long the cue has been on screen, used for the appearance
+ * animation (pass `Infinity` for the resting look).
  */
 export function drawCaption(
   ctx: Ctx,
@@ -67,7 +69,9 @@ export function drawCaption(
   height: number,
   style: CaptionStyle,
   highlightWord = -1,
+  ageSec = Infinity,
 ) {
+  const enter = captionEnter(style.animation, ageSec);
   const maxWidth = width * CAPTION_MAX_WIDTH;
   const text = caption.lines?.length ? caption.lines.join(" ") : caption.text;
 
@@ -90,6 +94,18 @@ export function drawCaption(
   const blockHeight = lineHeight * lines.length;
   const maxLineWidth = Math.max(...lines.map((l) => ctx.measureText(l).width));
   const top = blockTop(style, height, blockHeight);
+
+  // Free placement offset and appearance animation, applied to the whole block.
+  // Shared with the DOM preview (see `captionEnter`).
+  ctx.save();
+  if (enter.opacity < 1) ctx.globalAlpha *= enter.opacity;
+  ctx.translate(style.offsetX * width, style.offsetY * height + enter.shiftY * height);
+  if (enter.scale !== 1) {
+    const cy = top + blockHeight / 2;
+    ctx.translate(width / 2, cy);
+    ctx.scale(enter.scale, enter.scale);
+    ctx.translate(-width / 2, -cy);
+  }
 
   // Background box (one rounded box behind the whole block).
   if (style.treatment === "box") {
@@ -145,9 +161,7 @@ export function drawCaption(
     }
   }
 
-  ctx.shadowColor = "transparent";
-  ctx.shadowBlur = 0;
-  ctx.shadowOffsetY = 0;
+  ctx.restore();
 }
 
 /** Index into `caption.words` of the word being spoken at `t` (the last one started), or -1. */

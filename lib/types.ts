@@ -1,3 +1,5 @@
+import type { CaptionPlacement } from "./caption-style";
+
 /** One spoken word with times in seconds. */
 export type Word = {
   text: string;
@@ -15,6 +17,8 @@ export type Caption = {
   /** Kept for word highlighting and cheap re-grouping. */
   words: Word[];
   lines?: string[];
+  /** This cue's own position; falls back to the style's default when absent. */
+  placement?: CaptionPlacement;
 };
 
 export type Transcript = {

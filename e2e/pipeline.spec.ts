@@ -159,6 +159,89 @@ test("a caption can be retimed on the timeline and the new time is exported", as
   expect(startSec).toBeGreaterThan(0.3);
 });
 
+test("a caption can be dragged anywhere in the frame", async ({ page }) => {
+  await mockApi(page);
+  await runPipeline(page, "speech.mp4");
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+
+  // Paused, so the caption is settled and easy to grab.
+  await page.getByTestId("captions").getByRole("button").first().click();
+  const block = page.getByTestId("overlay").locator("[data-caption-block]");
+  await expect(block).toBeVisible();
+
+  const before = (await block.boundingBox())!;
+  await page.mouse.move(before.x + before.width / 2, before.y + before.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(before.x + before.width / 2, before.y + before.height / 2 - 120, { steps: 8 });
+  await page.mouse.up();
+
+  const after = (await block.boundingBox())!;
+  expect(after.y).toBeLessThan(before.y - 40);
+
+  // Placement is per caption, so it marks this cue (and drives the export).
+  await expect(block).toHaveAttribute("data-offset-y", /^-\d/);
+  await expect(page.getByTestId("captions")).toContainText("moved");
+});
+
+test("each caption can sit in its own spot", async ({ page }) => {
+  await mockApi(page, [
+    { text: "Hello", start: 0.2, end: 0.7 },
+    { text: "again", start: 2.0, end: 2.5 },
+  ]);
+  await runPipeline(page, "speech.mp4");
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+
+  const block = page.getByTestId("overlay").locator("[data-caption-block]");
+  const captions = page.getByTestId("captions");
+
+  // Move the first caption up; the second keeps the default spot.
+  await captions.getByRole("button", { name: "0:00" }).click();
+  await expect(block).toHaveAttribute("data-offset-y", "0");
+  const box = (await block.boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2 - 100, { steps: 6 });
+  await page.mouse.up();
+  await expect(block).toHaveAttribute("data-offset-y", /^-\d/);
+
+  await captions.getByRole("button", { name: "0:02" }).click();
+  await expect(block).toHaveAttribute("data-offset-y", "0");
+});
+
+test("no caption is shown in the gap between captions", async ({ page }) => {
+  await mockApi(page, [
+    { text: "Hello", start: 0.2, end: 0.7 },
+    { text: "again", start: 2.0, end: 2.5 },
+  ]);
+  await runPipeline(page, "speech.mp4");
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+
+  const overlay = page.getByTestId("overlay");
+  await page.getByTestId("captions").getByRole("button", { name: "0:00" }).click();
+  await expect(overlay).toContainText("Hello");
+
+  // Jump into the gap between the two cues: nothing should be on screen.
+  await page.locator("video").evaluate((v: HTMLVideoElement) => {
+    v.currentTime = 1.5;
+  });
+  await expect(overlay).toHaveCount(0);
+
+  await page.locator("video").evaluate((v: HTMLVideoElement) => {
+    v.currentTime = 2.1;
+  });
+  await expect(overlay).toContainText("again");
+});
+
+test("captions animate in when they appear", async ({ page }) => {
+  await mockApi(page);
+  await runPipeline(page, "speech.mp4");
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+
+  await page.getByRole("button", { name: "Pop" }).click();
+  await page.getByTestId("captions").getByRole("button").first().click();
+  await expect(page.getByTestId("overlay").locator("[data-caption-block]")).toHaveAttribute("data-animation", "pop");
+});
+
 test("AVI falls back to ffmpeg.wasm", async ({ page }) => {
   const captured = await mockApi(page);
   await runPipeline(page, "speech.avi");

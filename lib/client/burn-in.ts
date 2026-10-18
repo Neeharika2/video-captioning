@@ -6,7 +6,7 @@
  * that frame's timestamp on a canvas, and it re-encodes (hardware where
  * available). Audio is copied unchanged when the container allows it.
  */
-import type { CaptionStyle } from "../caption-style";
+import { styleForCaption, type CaptionStyle } from "../caption-style";
 import type { Caption } from "../types";
 import { drawCaption, findCaptionAt, spokenWordAt } from "./caption-renderer";
 import type { SaveTarget } from "./save-file";
@@ -77,8 +77,10 @@ export async function burnInCaptions(
           const i = findCaptionAt(sorted, sample.timestamp);
           if (i >= 0) {
             const t = sample.timestamp;
-            const word = opts.style.emphasis === "highlight" ? spokenWordAt(sorted[i], t) : -1;
-            drawCaption(ctx, sorted[i], canvas.width, canvas.height, opts.style, word);
+            const cue = sorted[i];
+            const word = opts.style.emphasis === "highlight" ? spokenWordAt(cue, t) : -1;
+            // Per-cue placement + appearance animation, exactly as in the preview.
+            drawCaption(ctx, cue, canvas.width, canvas.height, styleForCaption(opts.style, cue.placement), word, t - cue.start);
           }
           return canvas;
         },
