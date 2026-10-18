@@ -1,0 +1,17 @@
+# Never upload local secrets or artifacts to Vercel.
+# (The app needs no GEMINI_API_KEY; users bring their own.)
+.env
+.env.*
+!.env.example
+
+# Local planning notes
+PLAN*.md
+
+# Local caches and test artifacts
+benchmark/.cache
+benchmark/results
+e2e/.fixtures
+test-results
+playwright-report
+coverage
+*.log
