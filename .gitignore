@@ -37,6 +37,10 @@
 *.tsbuildinfo
 next-env.d.ts
 
+# local planning notes
+PLAN.md
+PLAN.v2.md
+
 # benchmark: private audio, cache and raw results
 /benchmark/.cache/
 /benchmark/results/
