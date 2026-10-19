@@ -39,7 +39,3 @@ export type ApiError = {
   retryable: boolean;
   retryAfterSec?: number;
 };
-
-/** Accepts e.g. "te-IN", "en", "zh-Hant-TW". */
-export const LANGUAGE_CODE_RE = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8}){0,2}$/;
-export const MAX_LANGUAGE_CODES = 5;

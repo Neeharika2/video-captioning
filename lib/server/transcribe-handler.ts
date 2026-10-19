@@ -1,13 +1,8 @@
 import "server-only";
-import {
-  LANGUAGE_CODE_RE,
-  MAX_LANGUAGE_CODES,
-  type ApiError,
-  type ApiErrorCode,
-  type TranscribeResponse,
-} from "../api-types";
+import { type ApiError, type ApiErrorCode, type TranscribeResponse } from "../api-types";
 import { GeminiError, formatWait, transcribe as geminiTranscribe } from "../gemini";
 import { OggOpusError, oggOpusDuration } from "../ogg-duration";
+import type { Word } from "../types";
 import { missingKeyMessage, readApiKey } from "./api-key";
 import { getConfig, type ServerConfig } from "./config";
 import { getRateLimiter, type RateLimiter } from "./limits";
@@ -22,12 +17,14 @@ export type HandlerDeps = {
  * POST /api/transcribe
  *
  * Body: one Ogg Opus chunk (Content-Type: audio/ogg), ≤ maxChunkSeconds.
- * Query: ?languages=te-IN,en-IN (optional BCP-47 hints).
  *
  * Bring your own key: the visitor's Gemini key arrives in the
  * `x-gemini-api-key` header, is forwarded to Google for this request and never
  * stored. Spend therefore belongs to the visitor, so requests are only
  * rate-limited (per key and endpoint), not capped by a shared daily budget.
+ *
+ * Language is always auto-detected: no hint is accepted, so a stray setting can
+ * never force the wrong language (which is how one video leaked onto the next).
  *
  * Stateless: returns chunk-local word timings; the browser stitches chunks.
  * Never logs audio, transcript text or the key.
@@ -43,15 +40,6 @@ export async function handleTranscribe(request: Request, deps: HandlerDeps = {})
 
   const apiKey = readApiKey(request);
   if (!apiKey.ok) return fail(401, "needs_api_key", missingKeyMessage(apiKey.reason));
-
-  const url = new URL(request.url);
-  const languages = (url.searchParams.get("languages") ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (languages.length > MAX_LANGUAGE_CODES || languages.some((l) => !LANGUAGE_CODE_RE.test(l))) {
-    return fail(400, "bad_request", "Invalid languages parameter");
-  }
 
   const declared = Number(request.headers.get("content-length"));
   if (declared > config.maxUploadBytes) return tooLarge(config);
@@ -89,22 +77,27 @@ export async function handleTranscribe(request: Request, deps: HandlerDeps = {})
       audio,
       mimeType: "audio/ogg",
       timestamps: true,
-      languageCodes: languages.length ? languages : undefined,
       signal: request.signal,
       // Leave headroom under the route's maxDuration for parsing + response.
       timeoutMs: 270_000,
       maxAttempts: 2,
     });
+    const fallback = !result.words.length && result.text.trim() ? "even-timing" : undefined;
+    const words = fallback ? spreadWords(result.text, durationSec) : result.words;
     log({
       durationSec,
       keyId: apiKey.id,
       status: 200,
-      words: result.words.length,
+      words: words.length,
+      // Whether the model returned any transcript: 0 words + 0 text means the
+      // clip had no transcribable speech, which the UI surfaces to the visitor.
+      textLen: result.text.length,
+      ...(fallback ? { fallback } : {}),
       ms: Date.now() - started,
       attempts: result.attempts,
     });
     const body: TranscribeResponse = {
-      words: result.words,
+      words,
       text: result.text,
       durationSec,
       model: config.geminiModel,
@@ -123,6 +116,19 @@ export async function handleTranscribe(request: Request, deps: HandlerDeps = {})
     });
     return res;
   }
+}
+
+/**
+ * Last resort for a transcript the model returned without word timings: cues
+ * are built from word times, so a text-only response would otherwise land as an
+ * empty editor. Spread the words evenly across the chunk instead — approximate,
+ * but visible and editable, which beats showing nothing.
+ */
+function spreadWords(text: string, durationSec: number): Word[] {
+  const parts = text.trim().split(/\s+/).filter(Boolean);
+  if (!parts.length || !(durationSec > 0)) return [];
+  const step = durationSec / parts.length;
+  return parts.map((word, i) => ({ text: word, start: i * step, end: (i + 1) * step }));
 }
 
 function mapUpstreamError(err: unknown, config: ServerConfig): Response {

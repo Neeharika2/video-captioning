@@ -26,7 +26,6 @@ export class TranscribeError extends Error {
 export type TranscribeClientOptions = {
   /** The visitor's own Gemini key; forwarded to Google by our API and never stored. */
   apiKey: string;
-  languages?: string[];
   signal?: AbortSignal;
   /** 0..1 upload progress; after 1 the server is transcribing. */
   onUploadProgress?: (fraction: number) => void;
@@ -59,8 +58,7 @@ export async function transcribeChunk(audio: Blob, opts: TranscribeClientOptions
 function send(audio: Blob, opts: TranscribeClientOptions): Promise<TranscribeResponse> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    const qs = opts.languages?.length ? `?languages=${encodeURIComponent(opts.languages.join(","))}` : "";
-    xhr.open("POST", `${TRANSCRIBE_PATH}${qs}`);
+    xhr.open("POST", TRANSCRIBE_PATH);
     xhr.setRequestHeader("content-type", "audio/ogg");
     xhr.setRequestHeader(API_KEY_HEADER, opts.apiKey);
     xhr.responseType = "json";

@@ -19,6 +19,8 @@ export type Caption = {
   lines?: string[];
   /** This cue's own position; falls back to the style's default when absent. */
   placement?: CaptionPlacement;
+  /** This cue's own font scale; falls back to the style's `scale` when absent. */
+  scale?: number;
 };
 
 export type Transcript = {

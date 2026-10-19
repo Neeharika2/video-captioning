@@ -40,19 +40,19 @@ beforeAll(() => {
   ogg40s = make(40);
 });
 
-const okResult = (req: TranscribeRequest): TranscribeResult => ({
+const okResult = (): TranscribeResult => ({
   text: "hello",
   words: [{ text: "hello", start: 0.1, end: 0.5 }],
   latencyMs: 10,
   attempts: 1,
-  raw: { languages: req.languageCodes },
+  raw: {},
 });
 
-function request(body: Uint8Array | string, init: { type?: string; query?: string; key?: string | null } = {}) {
+function request(body: Uint8Array | string, init: { type?: string; key?: string | null } = {}) {
   const headers: Record<string, string> = { "content-type": init.type ?? "audio/ogg" };
   const key = init.key === undefined ? TEST_KEY : init.key;
   if (key) headers[API_KEY_HEADER] = key;
-  return new Request(`http://localhost/api/transcribe${init.query ?? ""}`, {
+  return new Request("http://localhost/api/transcribe", {
     method: "POST",
     headers,
     body: typeof body === "string" ? body : new Blob([body as BlobPart]),
@@ -64,7 +64,7 @@ async function call(req: Request, deps: Parameters<typeof handleTranscribe>[1] =
   const res = await handleTranscribe(req, {
     config,
     limiter: deps.limiter ?? new MemoryLimiter(config),
-    transcribe: deps.transcribe ?? (async (r) => okResult(r)),
+    transcribe: deps.transcribe ?? (async () => okResult()),
   });
   return { status: res.status, body: (await res.json()) as TranscribeResponse & ApiError, headers: res.headers };
 }
@@ -73,14 +73,34 @@ vi.spyOn(console, "info").mockImplementation(() => {});
 
 describe("handleTranscribe", () => {
   it("returns words and the server-measured duration, using the caller's key", async () => {
-    const transcribe = vi.fn(async (r: TranscribeRequest) => okResult(r));
-    const { status, body } = await call(request(ogg5s, { query: "?languages=te-IN,en-IN" }), { transcribe });
+    const transcribe = vi.fn<(req: TranscribeRequest) => Promise<TranscribeResult>>(async () => okResult());
+    const { status, body } = await call(request(ogg5s), { transcribe });
     expect(status).toBe(200);
     expect(body.words).toEqual([{ text: "hello", start: 0.1, end: 0.5 }]);
     expect(body.durationSec).toBeCloseTo(5, 1);
     expect(body.model).toBe("test-model");
     const sent = transcribe.mock.calls[0][0];
-    expect(sent).toMatchObject({ apiKey: TEST_KEY, timestamps: true, languageCodes: ["te-IN", "en-IN"] });
+    expect(sent).toMatchObject({ apiKey: TEST_KEY, timestamps: true });
+    expect(sent).not.toHaveProperty("languageCodes");
+  });
+
+  it("spreads a transcript that came back without word timings", async () => {
+    const { status, body } = await call(request(ogg5s), {
+      transcribe: async () => ({ text: "hello there world", words: [], latencyMs: 5, attempts: 1, raw: {} }),
+    });
+    expect(status).toBe(200);
+    expect(body.words.map((w) => w.text)).toEqual(["hello", "there", "world"]);
+    expect(body.words[0].start).toBe(0);
+    // Even split across the server-measured duration.
+    expect(body.words[body.words.length - 1].end).toBeCloseTo(5, 1);
+  });
+
+  it("leaves words empty when the clip had no speech to transcribe", async () => {
+    const { status, body } = await call(request(ogg5s), {
+      transcribe: async () => ({ text: "", words: [], latencyMs: 5, attempts: 1, raw: {} }),
+    });
+    expect(status).toBe(200);
+    expect(body.words).toEqual([]);
   });
 
   it("asks for a key when none is sent", async () => {
@@ -97,11 +117,10 @@ describe("handleTranscribe", () => {
     expect(body.error).toMatch(/doesn't look valid/);
   });
 
-  it("validates content type, body and language codes", async () => {
+  it("validates content type and body", async () => {
     expect((await call(request(ogg5s, { type: "application/json" }))).status).toBe(415);
     expect((await call(request("not ogg at all, just some text padding padding"))).body.code).toBe("unsupported_media");
     expect((await call(request(new Uint8Array()))).status).toBe(400);
-    expect((await call(request(ogg5s, { query: "?languages=te-IN,<script>" }))).status).toBe(400);
   });
 
   it("rejects uploads over the size limit", async () => {

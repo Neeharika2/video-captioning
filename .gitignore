@@ -57,3 +57,4 @@ PLAN.v4.md
 /e2e/.fixtures/
 /test-results/
 /playwright-report/
+.env*

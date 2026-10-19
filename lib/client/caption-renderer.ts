@@ -6,7 +6,14 @@
  * fonts (see `fontStack`), so Telugu and other complex scripts shape correctly.
  */
 import type { Caption } from "../types";
-import { blockTop, captionEnter, cssFont, fontSizeFor, type CaptionStyle, CAPTION_MAX_WIDTH } from "../caption-style";
+import { layoutCaption } from "../caption-layout";
+import {
+  blockTop,
+  captionEnter,
+  cssFont,
+  withAlpha,
+  type CaptionStyle,
+} from "../caption-style";
 
 type Ctx = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 
@@ -23,22 +30,6 @@ export function findCaptionAt(captions: Caption[], t: number): number {
     } else hi = mid - 1;
   }
   return found >= 0 && t < captions[found].end ? found : -1;
-}
-
-/** Wrap words to fit `maxWidth` pixels using the context's current font. */
-function wrapToWidth(ctx: Ctx, text: string, maxWidth: number): string[] {
-  const words = text.split(/\s+/).filter(Boolean);
-  const lines: string[] = [];
-  let line = "";
-  for (const w of words) {
-    const candidate = line ? `${line} ${w}` : w;
-    if (line && ctx.measureText(candidate).width > maxWidth) {
-      lines.push(line);
-      line = w;
-    } else line = candidate;
-  }
-  if (line) lines.push(line);
-  return lines;
 }
 
 function roundedRect(ctx: Ctx, x: number, y: number, w: number, h: number, r: number) {
@@ -72,20 +63,12 @@ export function drawCaption(
   ageSec = Infinity,
 ) {
   const enter = captionEnter(style.animation, ageSec);
-  const maxWidth = width * CAPTION_MAX_WIDTH;
-  const text = caption.lines?.length ? caption.lines.join(" ") : caption.text;
 
-  // Prefer the editor's line breaks; re-wrap by pixel width if they don't fit,
-  // shrinking the font if that would take more than 3 lines.
-  let fontSize = fontSizeFor(style, width, height);
-  let lines: string[] = [];
-  for (let attempt = 0; attempt < 4; attempt++) {
-    ctx.font = cssFont(style, fontSize);
-    const preferred = caption.lines?.length ? caption.lines : [caption.text];
-    lines = preferred.every((l) => ctx.measureText(l).width <= maxWidth) ? preferred : wrapToWidth(ctx, text, maxWidth);
-    if (lines.length <= 3) break;
-    fontSize = Math.round(fontSize * 0.85);
-  }
+  // Same line-breaking and fit-to-width logic as the DOM preview.
+  const { fontSize, lines } = layoutCaption(style, caption, width, height, (text, font) => {
+    ctx.font = font;
+    return ctx.measureText(text).width;
+  });
   ctx.font = cssFont(style, fontSize);
 
   const lineHeight = Math.round(fontSize * 1.3);
@@ -109,7 +92,7 @@ export function drawCaption(
 
   // Background box (one rounded box behind the whole block).
   if (style.treatment === "box") {
-    ctx.fillStyle = `rgba(0, 0, 0, ${style.boxOpacity})`;
+    ctx.fillStyle = withAlpha(style.boxColor, style.boxOpacity);
     roundedRect(ctx, (width - maxLineWidth) / 2 - padX, top - padY, maxLineWidth + padX * 2, blockHeight + padY * 2, fontSize * 0.35);
     ctx.fill();
   }
@@ -119,8 +102,11 @@ export function drawCaption(
     ctx.shadowColor = "rgba(0, 0, 0, 0.65)";
     ctx.shadowBlur = fontSize * 0.35;
     ctx.shadowOffsetY = Math.round(fontSize * 0.08);
+  } else if (style.treatment === "glow") {
+    ctx.shadowColor = style.highlightColor;
+    ctx.shadowBlur = fontSize * 0.55;
   }
-  const outline = style.treatment === "outline";
+  const outline = style.outline;
   if (outline) {
     ctx.lineJoin = "round";
     ctx.lineWidth = Math.max(2, fontSize * 0.14);

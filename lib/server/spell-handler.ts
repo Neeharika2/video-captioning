@@ -25,7 +25,7 @@ const MAX_BODY_BYTES = 64_000;
 /**
  * POST /api/spell
  *
- * Body (JSON): { words: string[], before?, after?, glossary?, languages? }
+ * Body (JSON): { words: string[], before?, after?, glossary? }
  * Header: `x-gemini-api-key` — the visitor's own key, forwarded to Google and
  * never stored. Returns one spelling per word, or null where the model's answer
  * failed the checks in lib/spelling.ts (the client keeps its rule-based

@@ -27,7 +27,6 @@ describe("buildTranscriptionBody", () => {
   it("builds a verbatim + word timestamp request with store=false", () => {
     const body = buildTranscriptionBody("m", "QUJD", "audio/ogg", {
       timestamps: true,
-      languageCodes: ["te-IN", "en-IN"],
     });
     expect(body).toEqual({
       model: "m",
@@ -35,7 +34,6 @@ describe("buildTranscriptionBody", () => {
       generation_config: {
         transcription_config: {
           mode: { type: "verbatim", timestamp_granularities: ["word"] },
-          language_codes: ["te-IN", "en-IN"],
         },
       },
       store: false,

@@ -37,8 +37,6 @@ const MAX_CHUNK_MIN = 25;
 const TruthSchema = z.object({
   /** Verbatim ground-truth transcript (include fillers like "um"). */
   text: z.string().min(1),
-  /** BCP-47 hints used by config C, e.g. ["te-IN", "en-IN"]. */
-  languageCodes: z.array(z.string()).optional(),
   /** Jargon / names used by config D and for glossary recall. */
   glossary: z.array(z.string()).optional(),
   /** Hand-timed words (a sample of 20–30 per clip is enough). */
@@ -49,14 +47,10 @@ type Truth = z.infer<typeof TruthSchema>;
 
 type Clip = { id: string; media: string; truth: Truth; opus: string; durationSec: number; opusBytes: number };
 
-type ConfigId = "A" | "B" | "C" | "D";
+type ConfigId = "A" | "B" | "D";
 const CONFIGS: Record<ConfigId, { label: string; build: (t: Truth) => TranscribeOptions | undefined }> = {
   A: { label: "verbatim", build: () => ({}) },
   B: { label: "verbatim + word timestamps", build: () => ({ timestamps: true }) },
-  C: {
-    label: "B + language_codes",
-    build: (t) => (t.languageCodes?.length ? { timestamps: true, languageCodes: t.languageCodes } : undefined),
-  },
   D: {
     label: "verbatim + custom_vocabulary",
     build: (t) => (t.glossary?.length ? { customVocabulary: t.glossary } : undefined),
@@ -84,7 +78,7 @@ async function main() {
   const { values } = parseArgs({
     options: {
       clips: { type: "string" },
-      configs: { type: "string", default: "A,B,C,D" },
+      configs: { type: "string", default: "A,B,D" },
       repeat: { type: "string", default: "1" },
       model: { type: "string" },
       "dry-run": { type: "boolean", default: false },
@@ -242,8 +236,6 @@ function renderReport(model: string, rows: RunRow[], clips: Clip[]): string {
   };
   const ab = pairDelta("A", "B");
   if (ab) lines.push(`- Timestamps cost: WER(B) − WER(A) = **${pp(ab.delta)}** over ${ab.n} clip(s).`);
-  const bc = pairDelta("B", "C");
-  if (bc) lines.push(`- Language hints: WER(C) − WER(B) = **${pp(bc.delta)}** over ${bc.n} clip(s) (negative = hints help).`);
   const ad = pairDelta("A", "D");
   if (ad) lines.push(`- Custom vocab: WER(D) − WER(A) = **${pp(ad.delta)}** over ${ad.n} clip(s); glossary recall A ${pct(agg.A?.glossary)} → D ${pct(agg.D?.glossary)}.`);
   const lats = Object.values(agg).map((a) => a.latPerMinMax).filter((x): x is number => x !== undefined);

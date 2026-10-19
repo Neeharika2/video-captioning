@@ -14,6 +14,7 @@ import type { ExtractEngine, ExtractResult } from "@/lib/client/extract-audio";
 import { downloadText } from "@/lib/client/save-file";
 import { offsetWords, TranscribeError } from "@/lib/client/transcribe-client";
 import { clearApiKey, getApiKey, setApiKey as storeApiKey } from "@/lib/client/api-key";
+import { detectLanguage, formatLanguage } from "@/lib/detect-language";
 import { DEFAULT_GROUP_OPTIONS, groupWords, wrapLines } from "@/lib/group-words";
 import { hasNonLatinLetters, romanize } from "@/lib/romanize";
 import { latinPunctuation, parseGlossary, type SpelledWord } from "@/lib/spelling";
@@ -40,13 +41,9 @@ type Status =
 /** "roman": non-English speech written in English letters ("ela unnaru", "aap kaise ho"). */
 type CaptionScript = "roman" | "original";
 type Settings = {
-  languages: string;
-  engine: "auto" | ExtractEngine;
   /** Look of the captions in the preview and the burned-in export. */
   style: CaptionStyle;
   script: CaptionScript;
-  /** Gemini pass that fixes romanized spelling and restores English words. */
-  smartSpelling: boolean;
   /** Terms to spell exactly, comma or newline separated. */
   glossary: string;
 };
@@ -58,27 +55,39 @@ type SpellStatus =
 
 function loadSettings(): Settings {
   const fallback: Settings = {
-    languages: "",
-    engine: "auto",
     style: DEFAULT_STYLE,
     script: "roman",
-    smartSpelling: true,
     glossary: "",
   };
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}") as Partial<Settings>;
+    // Older saves used a single "outline" treatment; outline is now its own axis.
+    const legacyOutline = (saved.style as { treatment?: string } | undefined)?.treatment === "outline";
+    const style: CaptionStyle = { ...fallback.style, ...(saved.style ?? {}) };
+    if (legacyOutline) {
+      style.treatment = "plain";
+      style.outline = true;
+    }
     return {
-      languages: saved.languages ?? fallback.languages,
-      engine: saved.engine ?? fallback.engine,
-      style: { ...fallback.style, ...(saved.style ?? {}) },
+      style,
       // Not restored: captions always start in English letters.
       script: fallback.script,
-      smartSpelling: saved.smartSpelling ?? fallback.smartSpelling,
       glossary: typeof saved.glossary === "string" ? saved.glossary : fallback.glossary,
     };
   } catch {
     return fallback;
   }
+}
+
+/**
+ * Extraction engine override for debugging and tests: `/debug?engine=ffmpeg`.
+ * The engine picker was removed from the UI; the default is Auto — Mediabunny
+ * with an ffmpeg.wasm fallback. Smart spelling is likewise always on.
+ */
+function engineOverride(): ExtractEngine | null {
+  if (typeof window === "undefined") return null;
+  const value = new URLSearchParams(window.location.search).get("engine");
+  return value === "ffmpeg" || value === "mediabunny" ? value : null;
 }
 
 /** Client-only (rendered with ssr: false), so reading localStorage on first render is safe. */
@@ -106,6 +115,12 @@ export function PipelineDebug() {
   const [spelled, setSpelled] = useState<(SpelledWord | null)[] | null>(null);
   const [spellStatus, setSpellStatus] = useState<SpellStatus>({ step: "idle" });
   const hasForeign = useMemo(() => words.some((w) => hasNonLatinLetters(w.text)), [words]);
+  /**
+   * Spoken language, read back from the transcript's script after transcription.
+   * Read-only: transcription always auto-detects (we never send a hint, which is
+   * how one video's language once leaked onto the next).
+   */
+  const detected = useMemo(() => detectLanguage(words.map((w) => w.text)), [words]);
   // Same words and timings, only respelled. Smart spelling wins where it
   // passed its checks; otherwise the instant rule-based spelling is used.
   const displayWords = useMemo(
@@ -124,6 +139,8 @@ export function PipelineDebug() {
   const [captionTimings, setCaptionTimings] = useState<Record<string, { start: number; end: number }>>({});
   /** Per-caption placement overrides, set by dragging a caption in the preview. */
   const [captionPlacements, setCaptionPlacements] = useState<Record<string, CaptionPlacement>>({});
+  /** Per-caption font-size overrides, set by dragging a corner in the preview. */
+  const [captionScales, setCaptionScales] = useState<Record<string, number>>({});
   const [selectedCaptionId, setSelectedCaptionId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -137,26 +154,25 @@ export function PipelineDebug() {
       baseCaptions.map((c) => {
         const timing = captionTimings[c.id];
         const placement = captionPlacements[c.id];
+        const scale = captionScales[c.id];
         const edited = captionEdits[c.id];
         const hasText = edited !== undefined && edited !== c.text;
-        if (!timing && !placement && !hasText) return c;
+        if (!timing && !placement && scale === undefined && !hasText) return c;
         const next = { ...c };
         if (timing) {
           next.start = timing.start;
           next.end = timing.end;
         }
         if (placement) next.placement = placement;
+        if (scale !== undefined) next.scale = scale;
         if (edited !== undefined && edited !== c.text) {
           next.text = edited;
           next.lines = wrapLines(edited, DEFAULT_GROUP_OPTIONS.maxCharsPerLine, DEFAULT_GROUP_OPTIONS.maxLines);
         }
         return next;
       }),
-    [baseCaptions, captionEdits, captionTimings, captionPlacements],
+    [baseCaptions, captionEdits, captionTimings, captionPlacements, captionScales],
   );
-  const romanized = settings.script === "roman" && hasForeign;
-  const language = romanized ? undefined : settings.languages.split(",")[0]?.trim() || undefined;
-
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
@@ -213,7 +229,7 @@ export function PipelineDebug() {
   const runSpelling = async (source: Word[]) => {
     spellAbortRef.current?.abort();
     setSpelled(null);
-    if (!settings.smartSpelling || !source.some((w) => hasNonLatinLetters(w.text))) {
+    if (!source.some((w) => hasNonLatinLetters(w.text))) {
       setSpellStatus({ step: "idle" });
       return;
     }
@@ -235,7 +251,6 @@ export function PipelineDebug() {
         {
           apiKey: key,
           glossary: parseGlossary(settings.glossary),
-          languages: languageList(settings.languages),
           signal: abort.signal,
           onBatch: (start, results) => {
             setSpelled((prev) => {
@@ -280,6 +295,7 @@ export function PipelineDebug() {
     setCaptionEdits({});
     setCaptionTimings({});
     setCaptionPlacements({});
+    setCaptionScales({});
     setSelectedCaptionId(null);
     setEditingId(null);
     setFile(f);
@@ -290,6 +306,38 @@ export function PipelineDebug() {
     setWords([]);
     setStatus({ step: "idle" });
     setLog(f ? [`Picked ${f.name} (${mb(f.size)})`] : []);
+  };
+
+  /**
+   * Upload one extracted track and turn it into timed words (step 2 of the
+   * pipeline). No language hint is sent, so Gemini detects and switches
+   * languages on its own.
+   */
+  const transcribeAudio = async (ex: ExtractResult, signal: AbortSignal) => {
+    setStatus({ step: "uploading", progress: 0 });
+    const { transcribeChunk } = await import("@/lib/client/transcribe-client");
+    const sentAt = Date.now();
+    const res = await transcribeChunk(ex.audio, {
+      apiKey: getApiKey() ?? "",
+      signal,
+      onUploadProgress: (p) =>
+        setStatus((prev) => {
+          if (p < 1) return { step: "uploading", progress: p };
+          if (prev.step === "transcribing") return prev;
+          setElapsedSec(0);
+          return { step: "transcribing", since: Date.now() };
+        }),
+      onRetry: (attempt, err) => addLog(`Attempt ${attempt} failed (${err.message}); retrying…`),
+    });
+    setResult(res);
+    const timed = offsetWords(res.words, ex.startOffsetSec);
+    setWords(timed);
+    addLog(
+      `Transcribed in ${((Date.now() - sentAt) / 1000).toFixed(1)} s → ${res.words.length} words ` +
+        `(server-measured ${res.durationSec.toFixed(1)} s)`,
+    );
+    setStatus({ step: "done" });
+    void runSpelling(timed);
   };
 
   const run = async () => {
@@ -311,15 +359,17 @@ export function PipelineDebug() {
     setCaptionEdits({});
     setCaptionTimings({});
     setCaptionPlacements({});
+    setCaptionScales({});
     setSelectedCaptionId(null);
     setEditingId(null);
     try {
       // 1. Extract
-      setStatus({ step: "extracting", progress: 0, engine: settings.engine === "ffmpeg" ? "ffmpeg" : "mediabunny" });
+      const forcedEngine = engineOverride();
+      setStatus({ step: "extracting", progress: 0, engine: forcedEngine ?? "mediabunny" });
       const { extractAudio } = await import("@/lib/client/extract-audio");
       const ex = await extractAudio(file, {
         signal: abort.signal,
-        engine: settings.engine === "auto" ? undefined : settings.engine,
+        engine: forcedEngine ?? undefined,
         onProgress: (progress, engine) => setStatus({ step: "extracting", progress, engine }),
       });
       setExtract(ex);
@@ -333,33 +383,8 @@ export function PipelineDebug() {
         throw new Error(`Audio is ${(ex.durationSec / 60).toFixed(1)} min; this phase supports up to 10 min.`);
       }
 
-      // 2. Upload + transcribe
-      setStatus({ step: "uploading", progress: 0 });
-      const { transcribeChunk } = await import("@/lib/client/transcribe-client");
-      const languages = languageList(settings.languages);
-      const sentAt = Date.now();
-      const res = await transcribeChunk(ex.audio, {
-        apiKey: key,
-        languages,
-        signal: abort.signal,
-        onUploadProgress: (p) =>
-          setStatus((prev) => {
-            if (p < 1) return { step: "uploading", progress: p };
-            if (prev.step === "transcribing") return prev;
-            setElapsedSec(0);
-            return { step: "transcribing", since: Date.now() };
-          }),
-        onRetry: (attempt, err) => addLog(`Attempt ${attempt} failed (${err.message}); retrying…`),
-      });
-      setResult(res);
-      const timed = offsetWords(res.words, ex.startOffsetSec);
-      setWords(timed);
-      addLog(
-        `Transcribed in ${((Date.now() - sentAt) / 1000).toFixed(1)} s → ${res.words.length} words ` +
-          `(server-measured ${res.durationSec.toFixed(1)} s)`,
-      );
-      setStatus({ step: "done" });
-      void runSpelling(timed);
+      // 2. Upload + transcribe (language is detected automatically)
+      await transcribeAudio(ex, abort.signal);
     } catch (err) {
       const message =
         err instanceof TranscribeError ? `${err.message} [${err.status || ""} ${err.code}]` : (err as Error).message;
@@ -429,6 +454,35 @@ export function PipelineDebug() {
   const resetPlacements = useCallback(() => {
     setCaptionPlacements({});
     setSettings((prev) => ({ ...prev, style: { ...prev.style, offsetX: 0, offsetY: 0 } }));
+  }, []);
+
+  /** Resize one caption, or the default style when no caption is on screen. */
+  const resizeCaption = useCallback((id: string | null, scale: number) => {
+    if (id) {
+      setCaptionScales((prev) => ({ ...prev, [id]: scale }));
+      return;
+    }
+    setSettings((prev) => ({ ...prev, style: { ...prev.style, scale } }));
+  }, []);
+
+  /** Apply the on-screen caption's size to every caption: it becomes the style default. */
+  const syncSize = useCallback((scale: number) => {
+    setCaptionScales({});
+    setSettings((prev) => ({ ...prev, style: { ...prev.style, scale } }));
+  }, []);
+
+  /** Apply the on-screen caption's spot to every caption: it becomes the style default. */
+  const syncPlacement = useCallback((placement: CaptionPlacement) => {
+    setCaptionPlacements({});
+    setSettings((prev) => ({
+      ...prev,
+      style: {
+        ...prev.style,
+        position: placement.position,
+        offsetX: placement.offsetX,
+        offsetY: placement.offsetY,
+      },
+    }));
   }, []);
 
   const onDrop = (e: DragEvent) => {
@@ -527,7 +581,11 @@ export function PipelineDebug() {
           )}
           {captions.length === 0 ? (
             <p className="rounded-xl border border-dashed border-zinc-200 p-4 text-sm text-zinc-500 dark:border-zinc-800">
-              {file ? "Your captions will appear here once you make them." : "Choose a video to get started."}
+              {!file
+                ? "Choose a video to get started."
+                : status.step === "done"
+                  ? "No speech was detected in this clip. Check that the video's audio has audible speech, then click Redo captions."
+                  : "Your captions will appear here once you make them."}
             </p>
           ) : (
             <ol className="flex flex-col gap-1" data-testid="captions">
@@ -535,6 +593,7 @@ export function PipelineDebug() {
                 const text = c.lines?.join(" ") ?? c.text;
                 const edited = captionEdits[c.id] !== undefined;
                 const moved = captionPlacements[c.id] !== undefined;
+                const sized = captionScales[c.id] !== undefined;
                 return (
                   <li key={c.id}>
                     <div
@@ -591,6 +650,14 @@ export function PipelineDebug() {
                               moved
                             </span>
                           )}
+                          {sized && (
+                            <span
+                              className="ml-2 text-[10px] font-medium tracking-wide text-violet-600 uppercase dark:text-violet-400"
+                              title="This caption has its own size"
+                            >
+                              sized
+                            </span>
+                          )}
                         </button>
                       )}
                     </div>
@@ -618,11 +685,13 @@ export function PipelineDebug() {
                 className="min-h-0 flex-1"
                 src={videoUrl}
                 captions={captions}
-                language={language}
                 style={settings.style}
                 videoRef={videoRef}
                 interactive={tab === "style"}
                 onPlacement={placeCaption}
+                onScale={resizeCaption}
+                onSyncSize={syncSize}
+                onSyncPlacement={syncPlacement}
               />
               <Timeline
                 videoRef={videoRef}
@@ -661,46 +730,16 @@ export function PipelineDebug() {
           <div className={`${tab === "settings" ? "flex" : "hidden"} min-h-0 flex-1 flex-col gap-5 overflow-y-auto p-4 text-sm`}>
             <ApiKeyField value={apiKey} onChange={updateApiKey} />
 
-            <label className="flex flex-col gap-1.5">
-              <span className="font-medium">Language hints (optional)</span>
-              <input
-                className="rounded-lg border border-zinc-300 bg-transparent px-3 py-2 dark:border-zinc-700"
-                value={settings.languages}
-                onChange={(e) => setSettings({ ...settings, languages: e.target.value })}
-                placeholder="te-IN,en-IN"
-              />
-              <span className="text-xs text-zinc-500">Comma-separated BCP-47 codes. Leave empty to auto-detect.</span>
-            </label>
-
-            <label className="flex flex-col gap-1.5">
-              <span className="font-medium">Extraction engine</span>
-              <select
-                className="rounded-lg border border-zinc-300 bg-transparent px-3 py-2 dark:border-zinc-700"
-                value={settings.engine}
-                onChange={(e) => setSettings({ ...settings, engine: e.target.value as Settings["engine"] })}
-              >
-                <option value="auto">Auto (Mediabunny, fallback ffmpeg)</option>
-                <option value="mediabunny">Mediabunny only</option>
-                <option value="ffmpeg">ffmpeg.wasm only</option>
-              </select>
-            </label>
+            <div className="flex flex-col gap-2">
+              <span className="font-medium">Language</span>
+              <p className="text-xs text-zinc-500" data-testid="detected-language">
+                {detected
+                  ? `Detected automatically: ${formatLanguage(detected)}`
+                  : "Detected automatically from the audio — Hindi, Telugu, English and mixed speech all work."}
+              </p>
+            </div>
 
             <div className="flex flex-col gap-3">
-              <label className="flex items-start gap-2">
-                <input
-                  type="checkbox"
-                  className="mt-0.5"
-                  checked={settings.smartSpelling}
-                  onChange={(e) => setSettings({ ...settings, smartSpelling: e.target.checked })}
-                />
-                <span>
-                  <span className="font-medium">Smart spelling</span>
-                  <span className="block text-xs text-zinc-500">
-                    After transcribing, a quick Gemini pass writes every word in natural English letters and fixes
-                    English words written in another script (టాపిక్ → topic, एलएलएम → LLMs). Timings don&apos;t change.
-                  </span>
-                </span>
-              </label>
               <label className="flex flex-col gap-1.5">
                 <span className="font-medium">Glossary (optional)</span>
                 <textarea
@@ -717,7 +756,7 @@ export function PipelineDebug() {
               {words.length > 0 && (
                 <button
                   type="button"
-                  disabled={busy || spellStatus.step === "running" || !settings.smartSpelling || !hasForeign}
+                  disabled={busy || spellStatus.step === "running" || !hasForeign}
                   onClick={() => void runSpelling(words)}
                   className="w-fit underline disabled:opacity-40"
                 >
@@ -971,13 +1010,6 @@ function findActive(words: Word[], t: number): number {
   }
   if (ans >= 0 && t - words[ans].end > 1.5) return -1;
   return ans;
-}
-
-function languageList(text: string) {
-  return text
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
 }
 
 function mb(bytes: number) {

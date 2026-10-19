@@ -25,7 +25,6 @@ export type SpellOptions = {
   /** The visitor's own Gemini key; forwarded to Google by our API and never stored. */
   apiKey: string;
   glossary?: string[];
-  languages?: string[];
   signal?: AbortSignal;
   /** Called as each batch finishes, with its results placed at `start`. */
   onBatch?: (start: number, results: (SpelledWord | null)[]) => void;
@@ -79,7 +78,6 @@ export async function spellWords(words: string[], opts: SpellOptions): Promise<S
         before: words.slice(Math.max(0, start - SPELL_CONTEXT_WORDS), start),
         after: words.slice(end, end + SPELL_CONTEXT_WORDS),
         ...(opts.glossary?.length ? { glossary: opts.glossary } : {}),
-        ...(opts.languages?.length ? { languages: opts.languages } : {}),
       };
       try {
         const res = await postBatch(request, opts.apiKey, opts.signal);

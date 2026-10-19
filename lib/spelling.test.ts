@@ -145,14 +145,12 @@ describe("buildSpellPrompt", () => {
       before: ["నమస్కారం."],
       after: ["అండి"],
       glossary: ["LLMs"],
-      languages: ["te-IN"],
     });
     expect(prompt).toContain("0\tఈ\tee");
     expect(prompt).toContain("1\tరోజు\troju");
     expect(prompt).toContain("2\toffice\t-");
     expect(prompt).toContain("Context before (do not return): నమస్కారం.");
     expect(prompt).toContain("Glossary: LLMs");
-    expect(prompt).toContain("Expected languages: te-IN");
     expect(prompt).toContain("Return all 3 IDs, 0 to 2.");
   });
 });

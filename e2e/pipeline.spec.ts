@@ -1,12 +1,12 @@
 import path from "node:path";
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 import type { TranscribeResponse } from "../lib/api-types";
 import { oggOpusDuration } from "../lib/ogg-duration";
 import { FIXTURES } from "./global-setup";
 
 const fixture = (name: string) => path.join(FIXTURES, name);
 
-type Captured = { bytes: Uint8Array; durationSec: number; contentType?: string };
+type Captured = { bytes: Uint8Array; durationSec: number; contentType?: string; languages: string | null };
 
 /** Mock the API so these tests are free and deterministic; checks the upload is real Ogg Opus. */
 async function mockApi(page: Page, words = [{ text: "Hello", start: 0.2, end: 0.6 }, { text: "everyone.", start: 0.6, end: 1.1 }]) {
@@ -14,7 +14,8 @@ async function mockApi(page: Page, words = [{ text: "Hello", start: 0.2, end: 0.
   await page.route("**/api/transcribe**", async (route) => {
     const bytes = new Uint8Array(route.request().postDataBuffer() ?? []);
     const durationSec = oggOpusDuration(bytes);
-    captured.push({ bytes, durationSec, contentType: route.request().headers()["content-type"] });
+    const languages = new URL(route.request().url()).searchParams.get("languages");
+    captured.push({ bytes, durationSec, contentType: route.request().headers()["content-type"], languages });
     const body: TranscribeResponse = {
       words,
       text: words.map((w) => w.text).join(" "),
@@ -29,6 +30,13 @@ async function mockApi(page: Page, words = [{ text: "Hello", start: 0.2, end: 0.
 /** Shape-valid fake key so the client-side "missing key" guard passes. */
 const E2E_KEY = "AIzaSyE2E-test-key_0123456789";
 
+/** Computed glyph outline width in px, used to assert the outline axis. */
+function strokeWidthOf(locator: Locator): Promise<number> {
+  return locator.evaluate(
+    (el) => parseFloat(getComputedStyle(el).getPropertyValue("-webkit-text-stroke-width")) || 0,
+  );
+}
+
 async function runPipeline(
   page: Page,
   file: string,
@@ -38,11 +46,8 @@ async function runPipeline(
   if (opts.withKey !== false) {
     await page.addInitScript((key) => window.localStorage.setItem("vc.geminiApiKey", key), E2E_KEY);
   }
-  await page.goto("/debug");
-  if (engine) {
-    await page.getByTestId("advanced").click();
-    await page.getByLabel("Extraction engine").selectOption(engine);
-  }
+  // The engine picker moved out of the UI; a query param still forces one for tests.
+  await page.goto(engine ? `/debug?engine=${engine}` : "/debug");
   await page.getByTestId("file-input").setInputFiles(fixture(file));
   await page.getByRole("button", { name: "Make captions" }).click();
 }
@@ -247,9 +252,125 @@ test("captions animate in when they appear", async ({ page }) => {
   await runPipeline(page, "speech.mp4");
   await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
 
-  await page.getByRole("button", { name: "Pop" }).click();
+  await page.getByRole("button", { name: "Pop", exact: true }).click();
   await page.getByTestId("captions").getByRole("button").first().click();
   await expect(page.getByTestId("overlay").locator("[data-caption-block]")).toHaveAttribute("data-animation", "pop");
+});
+
+test("style presets apply their look to the preview", async ({ page }) => {
+  await mockApi(page);
+  await runPipeline(page, "speech.mp4");
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+
+  await page.getByTestId("captions").getByRole("button").first().click();
+  const block = page.getByTestId("overlay").locator("[data-caption-block]");
+  await expect(block).toBeVisible();
+
+  // Bold Viral uppercases the text via CSS and strokes the glyphs (outline axis).
+  await page.getByRole("button", { name: "Bold Viral" }).click();
+  await expect(block).toHaveCSS("text-transform", "uppercase");
+  expect(await strokeWidthOf(block)).toBeGreaterThan(0);
+
+  // Soft Aesthetic paints the pastel pill from `boxColor` + `boxOpacity`, no outline.
+  await page.getByRole("button", { name: "Soft Aesthetic" }).click();
+  await expect(block).toHaveCSS("background-color", "rgba(252, 231, 243, 0.92)");
+  expect(await strokeWidthOf(block)).toBe(0);
+
+  // Outline is its own axis, so it layers onto any preset.
+  await page.getByRole("checkbox", { name: "Outline" }).check();
+  expect(await strokeWidthOf(block)).toBeGreaterThan(0);
+});
+
+test("the font picker previews each face in its own style", async ({ page }) => {
+  await mockApi(page);
+  await runPipeline(page, "speech.mp4");
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+
+  await page.getByTestId("captions").getByRole("button").first().click();
+  const block = page.getByTestId("overlay").locator("[data-caption-block]");
+  await expect(block).toBeVisible();
+
+  // The list renders each option in its own face before it is chosen.
+  await page.getByRole("button", { name: "Font" }).click();
+  const bungee = page.getByRole("option", { name: /Bungee/ });
+  await expect(bungee.locator("span").first()).toHaveCSS("font-family", /Bungee/);
+
+  // Choosing it switches the live preview over as well.
+  await bungee.click();
+  await expect(block).toHaveCSS("font-family", /Bungee/);
+});
+
+test("a caption can be resized from a corner and synced to all", async ({ page }) => {
+  await mockApi(page, [
+    { text: "Hello.", start: 0.2, end: 0.6 },
+    { text: "Second", start: 3, end: 3.4 },
+    { text: "caption.", start: 3.4, end: 3.9 },
+  ]);
+  await runPipeline(page, "speech.mp4");
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+
+  const captionButtons = page.getByTestId("captions").getByRole("button");
+  await captionButtons.first().click();
+  const block = page.getByTestId("overlay").locator("[data-caption-block]");
+  await expect(block).toBeVisible();
+  const before = await block.getAttribute("data-scale");
+
+  // Drag the south-east corner outwards: the cue gets its own size.
+  const handle = block.locator('[data-resize-handle="se"]');
+  const box = await handle.boundingBox();
+  if (!box) throw new Error("missing resize handle");
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2 + 100, box.y + box.height / 2 + 100, { steps: 10 });
+  await page.mouse.up();
+
+  const resized = await block.getAttribute("data-scale");
+  expect(Number(resized)).toBeGreaterThan(Number(before));
+  await expect(page.getByTestId("captions")).toContainText("sized");
+
+  // Make this cue's size the default for every cue.
+  await page.getByRole("button", { name: "Sync size to all" }).click();
+  await expect(block).toHaveAttribute("data-scale", resized ?? "");
+  await expect(page.getByTestId("captions")).not.toContainText("sized");
+
+  // The second cue now uses the same size.
+  await captionButtons.nth(2).click();
+  await expect(block).toHaveAttribute("data-scale", resized ?? "");
+});
+
+test("a caption can be moved and its position synced to all", async ({ page }) => {
+  await mockApi(page, [
+    { text: "Hello.", start: 0.2, end: 0.6 },
+    { text: "Second", start: 3, end: 3.4 },
+    { text: "caption.", start: 3.4, end: 3.9 },
+  ]);
+  await runPipeline(page, "speech.mp4");
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+
+  const captionButtons = page.getByTestId("captions").getByRole("button");
+  await captionButtons.first().click();
+  const block = page.getByTestId("overlay").locator("[data-caption-block]");
+  await expect(block).toBeVisible();
+
+  // Drag the caption up: the cue gets its own spot.
+  const before = (await block.boundingBox())!;
+  await page.mouse.move(before.x + before.width / 2, before.y + before.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(before.x + before.width / 2, before.y + before.height / 2 - 100, { steps: 8 });
+  await page.mouse.up();
+
+  const offsetY = await block.getAttribute("data-offset-y");
+  expect(offsetY).toMatch(/^-\d/);
+  await expect(page.getByTestId("captions")).toContainText("moved");
+
+  // Make this cue's spot the default for every cue.
+  await page.getByRole("button", { name: "Sync position to all" }).click();
+  await expect(block).toHaveAttribute("data-offset-y", offsetY ?? "");
+  await expect(page.getByTestId("captions")).not.toContainText("moved");
+
+  // The third cue now sits in the same spot.
+  await captionButtons.nth(2).click();
+  await expect(block).toHaveAttribute("data-offset-y", offsetY ?? "");
 });
 
 test("AVI falls back to ffmpeg.wasm", async ({ page }) => {
@@ -314,4 +435,25 @@ test("asks for a personal API key when none is set", async ({ page }) => {
   await expect(page.getByTestId("api-key")).toBeVisible();
   await expect(page.getByTestId("api-key-notice")).toBeVisible();
   expect(captured).toHaveLength(0);
+});
+
+test("reads back the language Gemini detected, and never sends a hint", async ({ page }) => {
+  const captured = await mockApi(page, [
+    { text: "आप", start: 0.2, end: 0.5 },
+    { text: "कैसे", start: 0.5, end: 0.8 },
+    { text: "हैं", start: 0.8, end: 1.1 },
+  ]);
+  // Keep the (always-on) spelling pass local; it doesn't affect this assertion.
+  await page.route("**/api/spell**", async (route) => {
+    const body = route.request().postDataJSON() as { words: string[] };
+    await route.fulfill({ json: { words: body.words.map(() => null), rejected: body.words.length, model: "mock" } });
+  });
+
+  await runPipeline(page, "speech.mp4");
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+  // The automatic pass sends no hint: Gemini chooses the language itself.
+  expect(captured[0].languages).toBeNull();
+
+  await page.getByTestId("advanced").click();
+  await expect(page.getByTestId("detected-language")).toContainText("Devanagari script");
 });

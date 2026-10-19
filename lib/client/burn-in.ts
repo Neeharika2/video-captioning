@@ -8,6 +8,7 @@
  */
 import { styleForCaption, type CaptionStyle } from "../caption-style";
 import type { Caption } from "../types";
+import { ensureCaptionFont } from "./caption-fonts";
 import { drawCaption, findCaptionAt, spokenWordAt } from "./caption-renderer";
 import type { SaveTarget } from "./save-file";
 
@@ -56,6 +57,10 @@ export async function burnInCaptions(
     let canvas: OffscreenCanvas | undefined;
     let ctx: OffscreenCanvasRenderingContext2D | null = null;
 
+    // Wait for the caption face so the burned-in text matches the preview's
+    // metrics and line breaks. System stacks resolve immediately.
+    await ensureCaptionFont(opts.style.fontFamily, opts.style.weight);
+
     const conversion = await mb.Conversion.init({
       input,
       output,
@@ -80,7 +85,7 @@ export async function burnInCaptions(
             const cue = sorted[i];
             const word = opts.style.emphasis === "highlight" ? spokenWordAt(cue, t) : -1;
             // Per-cue placement + appearance animation, exactly as in the preview.
-            drawCaption(ctx, cue, canvas.width, canvas.height, styleForCaption(opts.style, cue.placement), word, t - cue.start);
+            drawCaption(ctx, cue, canvas.width, canvas.height, styleForCaption(opts.style, cue.placement, cue.scale), word, t - cue.start);
           }
           return canvas;
         },

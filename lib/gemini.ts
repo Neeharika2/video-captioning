@@ -23,8 +23,6 @@ export type TranscribeOptions = {
   timestamps?: boolean;
   /** Speaker labels. Not allowed with `customVocabulary`. */
   diarization?: boolean;
-  /** BCP-47 hints, e.g. ["te-IN", "en-IN"]. Omit for auto-detect. */
-  languageCodes?: string[];
   /** Up to 1000 terms. Not allowed with timestamps or diarization. */
   customVocabulary?: string[];
 };
@@ -126,7 +124,6 @@ export function buildTranscriptionBody(
   if (opts.diarization) mode.diarization_mode = "speaker";
 
   const transcription_config: Record<string, unknown> = { mode };
-  if (opts.languageCodes?.length) transcription_config.language_codes = opts.languageCodes;
   if (vocab.length) transcription_config.custom_vocabulary = vocab;
 
   return {

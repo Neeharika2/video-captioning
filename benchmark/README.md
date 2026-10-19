@@ -7,10 +7,9 @@ single-pass vs two-pass decision (PLAN.md §8, Phase 0) is based on numbers.
 |---|---|---|
 | A | verbatim | text accuracy baseline |
 | B | verbatim + word timestamps | do timestamps hurt accuracy? timing error |
-| C | B + `language_codes` from `truth.json` | do language hints help? |
 | D | verbatim + `custom_vocabulary` from `truth.json` | does a glossary fix jargon? |
 
-C and D only run for clips that have `languageCodes` / `glossary`.
+D only runs for clips that have `glossary`.
 
 ## Setup
 
@@ -37,7 +36,6 @@ benchmark/clips/telugu-vlog-1/
 ```json
 {
   "text": "Verbatim transcript of everything said, including um and uh.",
-  "languageCodes": ["te-IN", "en-IN"],
   "glossary": ["Kubernetes", "Ravi Teja"],
   "words": [
     { "text": "Kubernetes", "start": 12.34, "end": 13.02 },
@@ -55,15 +53,15 @@ benchmark/clips/telugu-vlog-1/
 - **`words`** (optional, enables timing metrics): 20–30 hand-timed words per clip is enough.
   Spread them across the clip. Easiest way: open the audio in Audacity, zoom in, and read
   the start/end of each word from the selection toolbar.
-- `languageCodes` / `glossary` are optional and enable configs C / D.
+- `glossary` is optional and enables config D.
 
-Target set (5–10 clips): names + jargon, noisy/overlapping speech, Telugu–English
-code-switching, fast speech, long pauses.
+Target set (5–10 clips): names + jargon, noisy/overlapping speech, code-switching,
+fast speech, long pauses.
 
 ## Running
 
 ```bash
-pnpm bench                              # all clips, configs A–D
+pnpm bench                              # all clips, configs A, B, D
 pnpm bench --clips a,b --configs A,B    # subset
 pnpm bench --repeat 3                   # repeat to see run-to-run variance
 pnpm bench --model gemini-3.5-transcribe

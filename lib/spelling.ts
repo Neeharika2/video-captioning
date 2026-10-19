@@ -11,7 +11,6 @@
  * Shared by the server (prompt + checks) and the client (request types).
  */
 import { z } from "zod";
-import { LANGUAGE_CODE_RE, MAX_LANGUAGE_CODES } from "./api-types";
 import { romanize } from "./romanize";
 
 export const SPELL_PATH = "/api/spell";
@@ -31,8 +30,6 @@ export const SpellRequestSchema = z.object({
   after: z.array(z.string().max(MAX_WORD_LENGTH)).max(SPELL_CONTEXT_WORDS).optional(),
   /** Terms that should come out spelled exactly like this (LLMs, Kubernetes). */
   glossary: z.array(z.string().trim().min(1).max(MAX_TERM_LENGTH)).max(MAX_GLOSSARY_TERMS).optional(),
-  /** BCP-47 hints for the spoken languages, if the user gave any. */
-  languages: z.array(z.string().regex(LANGUAGE_CODE_RE)).max(MAX_LANGUAGE_CODES).optional(),
 });
 export type SpellRequest = z.infer<typeof SpellRequestSchema>;
 
@@ -78,7 +75,6 @@ Some input words come with a rule-based "hint" spelling. The hint is usually fin
 
 export function buildSpellPrompt(req: SpellRequest): string {
   const lines: string[] = [];
-  if (req.languages?.length) lines.push(`Expected languages: ${req.languages.join(", ")}`);
   if (req.glossary?.length) lines.push(`Glossary: ${req.glossary.join(", ")}`);
   if (lines.length) lines.push("");
   if (req.before?.length) lines.push(`Context before (do not return): ${req.before.join(" ")}`);

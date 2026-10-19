@@ -70,7 +70,6 @@ describe("handleSpell", () => {
     expect((await handleSpell(post("{oops"), d)).status).toBe(400);
     expect((await handleSpell(post({ words: ["a"] }, { type: "text/plain" }), d)).status).toBe(415);
     expect((await handleSpell(post({ words: Array(301).fill("a") }), d)).status).toBe(400);
-    expect((await handleSpell(post({ words: ["a"], languages: ["not a code"] }), d)).status).toBe(400);
     expect((await handleSpell(post({ words: ["x".repeat(70_000)] }), d)).status).toBe(413);
     expect(d.generate).not.toHaveBeenCalled();
   });
