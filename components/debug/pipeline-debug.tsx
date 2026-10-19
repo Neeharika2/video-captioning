@@ -10,7 +10,15 @@ import {
   useState,
 } from "react";
 import type { TranscribeResponse } from "@/lib/api-types";
-import type { ExtractEngine, ExtractResult } from "@/lib/client/extract-audio";
+import { extractAudioRange, hasSpeech, type ExtractEngine, type ExtractResult } from "@/lib/client/extract-audio";
+import {
+  coverageRatio,
+  findCoverageGaps,
+  mergeWords,
+  planWindows,
+  splitRange,
+  type TimeRange,
+} from "@/lib/client/caption-coverage";
 import { downloadText } from "@/lib/client/save-file";
 import { offsetWords, TranscribeError } from "@/lib/client/transcribe-client";
 import { clearApiKey, getApiKey, setApiKey as storeApiKey } from "@/lib/client/api-key";
@@ -29,6 +37,22 @@ import { Timeline } from "./timeline";
 /** Phase 1 limit (PLAN.md): one ≤10 min chunk per video. */
 const MAX_SECONDS = 600;
 const STORAGE_KEY = "vc.debug.settings";
+/**
+ * Auto-detect reads one language per request, so the whole track is tried first
+ * and whatever it skipped is re-transcribed on its own. A missing stretch must
+ * be at least this long to be worth a request.
+ */
+const MIN_REPAIR_GAP_SEC = 2.5;
+/** Never spend a request on a stretch shorter than this. */
+const MIN_CHUNK_SEC = 2;
+/** Longest stretch one repair request may cover before it is windowed. */
+const MAX_CHUNK_SEC = 20;
+/** Hard cap on requests per video, so silence/music can't run away. */
+const MAX_REQUESTS = 40;
+/** How far the halving recursion may go. */
+const MAX_REPAIR_DEPTH = 6;
+/** Cap on splits caused by a request returning nothing (music/silence can do this). */
+const MAX_EMPTY_SPLITS = 6;
 
 type Status =
   | { step: "idle" }
@@ -88,6 +112,21 @@ function engineOverride(): ExtractEngine | null {
   if (typeof window === "undefined") return null;
   const value = new URLSearchParams(window.location.search).get("engine");
   return value === "ffmpeg" || value === "mediabunny" ? value : null;
+}
+
+/**
+ * Auto-repair switch for tests: `/debug?repair=off` keeps the single whole-track
+ * request so UI tests don't fan out into extra calls. Production always repairs.
+ */
+function repairDisabled(): boolean {
+  if (typeof window === "undefined") return false;
+  return new URLSearchParams(window.location.search).get("repair") === "off";
+}
+
+/** "1:05" for the log lines. */
+function fmtTime(sec: number): string {
+  const s = Math.max(0, Math.round(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
 /** Client-only (rendered with ssr: false), so reading localStorage on first render is safe. */
@@ -309,35 +348,122 @@ export function PipelineDebug() {
   };
 
   /**
-   * Upload one extracted track and turn it into timed words (step 2 of the
+   * Upload the extracted track and turn it into timed words (step 2 of the
    * pipeline). No language hint is sent, so Gemini detects and switches
-   * languages on its own.
+   * languages on its own. Auto-detect reads one language per request, though, so
+   * pass 1 is the whole track and every stretch it skipped is re-transcribed on
+   * its own — halving any stretch that is still mixed — until each request hears
+   * a single language (see lib/client/caption-coverage.ts).
    */
   const transcribeAudio = async (ex: ExtractResult, signal: AbortSignal) => {
-    setStatus({ step: "uploading", progress: 0 });
     const { transcribeChunk } = await import("@/lib/client/transcribe-client");
-    const sentAt = Date.now();
-    const res = await transcribeChunk(ex.audio, {
-      apiKey: getApiKey() ?? "",
-      signal,
-      onUploadProgress: (p) =>
-        setStatus((prev) => {
-          if (p < 1) return { step: "uploading", progress: p };
-          if (prev.step === "transcribing") return prev;
-          setElapsedSec(0);
-          return { step: "transcribing", since: Date.now() };
-        }),
-      onRetry: (attempt, err) => addLog(`Attempt ${attempt} failed (${err.message}); retrying…`),
-    });
-    setResult(res);
-    const timed = offsetWords(res.words, ex.startOffsetSec);
-    setWords(timed);
+    const apiKey = getApiKey() ?? "";
+    const audioStart = ex.startOffsetSec;
+    const audioEnd = ex.startOffsetSec + ex.durationSec;
+    const startedAt = Date.now();
+    const collected: Word[] = [];
+    let requests = 0;
+    let emptySplits = 0;
+
+    const send = async (blob: Blob, label: string) => {
+      setStatus({ step: "uploading", progress: 0 });
+      requests++;
+      const res = await transcribeChunk(blob, {
+        apiKey,
+        signal,
+        onUploadProgress: (p) =>
+          setStatus((prev) => {
+            if (p < 1) return { step: "uploading", progress: p };
+            if (prev.step === "transcribing") return prev;
+            setElapsedSec(0);
+            return { step: "transcribing", since: Date.now() };
+          }),
+        onRetry: (attempt, err) => addLog(`Attempt ${attempt} failed (${err.message}); retrying…`),
+      });
+      addLog(`${label}: ${res.words.length} words (server-measured ${res.durationSec.toFixed(1)} s)`);
+      return res;
+    };
+
+    // Pass 1: the whole extracted track.
+    const first = await send(ex.audio, "Full track");
+    const pass1 = offsetWords(first.words, audioStart);
+    collected.push(...pass1);
+
+    /**
+     * Transcribe one stretch on its own. A stretch can itself hold more than one
+     * language, so if it is barely covered, halve it and try each half.
+     */
+    const repair = async (range: TimeRange, depth: number, allowEmptySplit: boolean): Promise<void> => {
+      if (signal.aborted || depth > MAX_REPAIR_DEPTH || requests >= MAX_REQUESTS) return;
+      const length = range.end - range.start;
+      if (length < MIN_CHUNK_SEC) return;
+      if (length > MAX_CHUNK_SEC) {
+        for (const window of planWindows(range, MAX_CHUNK_SEC)) await repair(window, depth + 1, allowEmptySplit);
+        return;
+      }
+      try {
+        if (!file || !(await hasSpeech(file, range.start, range.end, { signal }))) {
+          addLog(`Skipped ${fmtTime(range.start)}–${fmtTime(range.end)}: no speech`);
+          return;
+        }
+        const slice = await extractAudioRange(file, range.start, range.end, { signal });
+        const res = await send(slice.audio, `Fix ${fmtTime(range.start)}–${fmtTime(range.end)}`);
+        const words = offsetWords(res.words, slice.startOffsetSec);
+        collected.push(...words);
+        if (!words.length) {
+          // Could be a silent/musical stretch or two languages the model both
+          // dropped. Split a bounded number of times before giving up.
+          if (allowEmptySplit && emptySplits < MAX_EMPTY_SPLITS) {
+            emptySplits++;
+            const [a, b] = splitRange(range);
+            await repair(a, depth + 1, true);
+            await repair(b, depth + 1, true);
+          }
+          return;
+        }
+        if (coverageRatio(words, range.start, range.end) < 0.5) {
+          const [a, b] = splitRange(range);
+          await repair(a, depth + 1, true);
+          await repair(b, depth + 1, true);
+        } else {
+          for (const gap of findCoverageGaps(words, range.start, range.end, MIN_REPAIR_GAP_SEC)) {
+            await repair(gap, depth + 1, true);
+          }
+        }
+      } catch (err) {
+        if (signal.aborted) throw err;
+        if (!collected.length) throw err;
+        addLog(`Stopped repairing ${fmtTime(range.start)}–${fmtTime(range.end)}: ${(err as Error).message}`);
+      }
+    };
+
+    if (!repairDisabled()) {
+      const gaps = findCoverageGaps(pass1, audioStart, audioEnd, MIN_REPAIR_GAP_SEC);
+      if (pass1.length === 0) {
+        if (file && (await hasSpeech(file, audioStart, audioEnd, { signal }))) {
+          addLog("Gemini returned no words; re-transcribing in shorter sections…");
+          await repair({ start: audioStart, end: audioEnd }, 1, true);
+        } else if (file) {
+          addLog("No speech detected in this clip.");
+        }
+      } else if (gaps.length) {
+        addLog(
+          `Gemini covered ${(coverageRatio(pass1, audioStart, audioEnd) * 100).toFixed(0)}% of the audio; ` +
+            `re-transcribing ${gaps.length} missed stretch(es)…`,
+        );
+        for (const gap of gaps) await repair(gap, 1, true);
+      }
+    }
+
+    const words = mergeWords([collected]);
+    setResult({ ...first, words, text: words.map((w) => w.text).join(" "), durationSec: ex.durationSec });
+    setWords(words);
     addLog(
-      `Transcribed in ${((Date.now() - sentAt) / 1000).toFixed(1)} s → ${res.words.length} words ` +
-        `(server-measured ${res.durationSec.toFixed(1)} s)`,
+      `Transcribed in ${((Date.now() - startedAt) / 1000).toFixed(1)} s → ${words.length} words ` +
+        `(${requests} request${requests === 1 ? "" : "s"}, server-measured ${first.durationSec.toFixed(1)} s)`,
     );
     setStatus({ step: "done" });
-    void runSpelling(timed);
+    void runSpelling(words);
   };
 
   const run = async () => {

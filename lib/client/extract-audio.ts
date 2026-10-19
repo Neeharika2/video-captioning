@@ -4,7 +4,13 @@
  *
  * Engine 1: Mediabunny (WebCodecs) — streams the file, uses hardware decoders.
  * Engine 2: ffmpeg.wasm fallback for containers/codecs the browser can't decode.
+ *
+ * `extractAudioRange` pulls just a slice of the timeline, which the multi-request
+ * transcription uses to re-transcribe the parts Gemini skipped (see
+ * lib/client/caption-coverage.ts).
  */
+import type { TimeRange } from "./caption-coverage";
+
 export type ExtractEngine = "mediabunny" | "ffmpeg";
 
 export type ExtractResult = {
@@ -28,6 +34,8 @@ export type ExtractOptions = {
   engine?: ExtractEngine;
 };
 
+type EngineOptions = ExtractOptions & { range?: TimeRange };
+
 export class NoAudioTrackError extends Error {
   constructor() {
     super("This video has no audio track.");
@@ -37,6 +45,8 @@ export class NoAudioTrackError extends Error {
 
 export const OPUS_BITRATE = 24_000;
 export const OPUS_SAMPLE_RATE = 16_000;
+/** Mean amplitude below which a slice is treated as silence (0..1 floats). */
+export const SPEECH_RMS = 0.002;
 
 export async function extractAudio(file: File, opts: ExtractOptions = {}): Promise<ExtractResult> {
   const started = performance.now();
@@ -52,6 +62,78 @@ export async function extractAudio(file: File, opts: ExtractOptions = {}): Promi
   }
 }
 
+/** Extract and encode just [startSec, endSec) of the video's audio track. */
+export async function extractAudioRange(
+  file: File,
+  startSec: number,
+  endSec: number,
+  opts: ExtractOptions = {},
+): Promise<ExtractResult> {
+  const started = performance.now();
+  const range: TimeRange = { start: Math.max(0, startSec), end: endSec };
+  const rangeOpts: EngineOptions = { ...opts, range };
+  if (opts.engine === "ffmpeg") return finish(await extractWithFfmpeg(file, rangeOpts), started);
+
+  try {
+    return finish(await extractWithMediabunny(file, rangeOpts), started);
+  } catch (err) {
+    if (opts.signal?.aborted || err instanceof NoAudioTrackError || opts.engine === "mediabunny") throw err;
+    const fallbackReason = (err as Error).message;
+    console.warn("[extract] Mediabunny range failed, falling back to ffmpeg.wasm:", fallbackReason);
+    return { ...finish(await extractWithFfmpeg(file, rangeOpts), started), fallbackReason };
+  }
+}
+
+/**
+ * Whether [startSec, endSec) holds audible speech. Used to avoid spending a
+ * request on a silent gap. If loudness can't be measured, assume speech (so a
+ * decoder quirk never silently skips real audio).
+ */
+export async function hasSpeech(
+  file: File,
+  startSec: number,
+  endSec: number,
+  opts: { signal?: AbortSignal; threshold?: number } = {},
+): Promise<boolean> {
+  const mb = await import("mediabunny");
+  let input: import("mediabunny").Input | null = null;
+  try {
+    input = new mb.Input({ formats: mb.ALL_FORMATS, source: new mb.BlobSource(file) });
+    const track = await input.getPrimaryAudioTrack();
+    if (!track) return false;
+    const sink = new mb.AudioBufferSink(track);
+    const threshold = opts.threshold ?? SPEECH_RMS;
+    for (const window of sampleWindows(startSec, endSec)) {
+      if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      for await (const { buffer } of sink.buffers(window.start, window.end)) {
+        const data = buffer.getChannelData(0);
+        let sumSq = 0;
+        for (let i = 0; i < data.length; i++) sumSq += data[i] * data[i];
+        if (data.length && Math.sqrt(sumSq / data.length) >= threshold) return true;
+      }
+    }
+    return false;
+  } catch (err) {
+    if (opts.signal?.aborted) throw err;
+    return true;
+  } finally {
+    input?.dispose();
+  }
+}
+
+/** Decode at most a few short windows of a long range, so this stays cheap. */
+function sampleWindows(startSec: number, endSec: number, maxWindows = 6, windowSec = 2): TimeRange[] {
+  const length = endSec - startSec;
+  if (length <= windowSec * maxWindows) return [{ start: startSec, end: endSec }];
+  const step = length / maxWindows;
+  const out: TimeRange[] = [];
+  for (let i = 0; i < maxWindows; i++) {
+    const start = startSec + i * step;
+    out.push({ start, end: Math.min(endSec, start + windowSec) });
+  }
+  return out;
+}
+
 type EngineResult = Omit<ExtractResult, "elapsedMs" | "fallbackReason">;
 
 function finish(r: EngineResult, started: number): ExtractResult {
@@ -60,7 +142,7 @@ function finish(r: EngineResult, started: number): ExtractResult {
 
 // ---------------------------------------------------------------------------
 
-async function extractWithMediabunny(file: File, opts: ExtractOptions): Promise<EngineResult> {
+async function extractWithMediabunny(file: File, opts: EngineOptions): Promise<EngineResult> {
   const mb = await import("mediabunny");
   const input = new mb.Input({ formats: mb.ALL_FORMATS, source: new mb.BlobSource(file) });
   try {
@@ -82,6 +164,7 @@ async function extractWithMediabunny(file: File, opts: ExtractOptions): Promise<
       input,
       output,
       tracks: "primary",
+      trim: opts.range ? { start: opts.range.start, end: opts.range.end } : undefined,
       video: { discard: true },
       audio: { codec: "opus", numberOfChannels: 1, sampleRate, quality, forceTranscode: true },
       showWarnings: false,
@@ -102,11 +185,14 @@ async function extractWithMediabunny(file: File, opts: ExtractOptions): Promise<
 
     const buffer = output.target.buffer;
     if (!buffer) throw new Error("Conversion produced no output");
-    const startOffsetSec = Math.max(0, await track.getFirstTimestamp());
-    const durationSec = await track.computeDuration();
+    // A range's output is offset so it starts at `range.start` on the video timeline.
+    const startOffsetSec = opts.range ? Math.max(0, opts.range.start) : Math.max(0, await track.getFirstTimestamp());
+    const durationSec = opts.range
+      ? Math.max(0, opts.range.end - opts.range.start)
+      : Math.max(0, (await track.computeDuration()) - startOffsetSec);
     return {
       audio: new Blob([buffer], { type: "audio/ogg" }),
-      durationSec: Math.max(0, durationSec - startOffsetSec),
+      durationSec,
       startOffsetSec,
       engine: "mediabunny",
     };
@@ -117,7 +203,7 @@ async function extractWithMediabunny(file: File, opts: ExtractOptions): Promise<
 
 // ---------------------------------------------------------------------------
 
-async function extractWithFfmpeg(file: File, opts: ExtractOptions): Promise<EngineResult> {
+async function extractWithFfmpeg(file: File, opts: EngineOptions): Promise<EngineResult> {
   const { createFfmpeg, mountInput } = await import("./ffmpeg");
   const loaded = await createFfmpeg({
     signal: opts.signal,
@@ -126,8 +212,12 @@ async function extractWithFfmpeg(file: File, opts: ExtractOptions): Promise<Engi
   const { ffmpeg, media } = loaded;
   try {
     const inputPath = await mountInput(loaded, file);
+    const seek = opts.range
+      ? ["-ss", opts.range.start.toFixed(3), "-t", (opts.range.end - opts.range.start).toFixed(3)]
+      : [];
     const code = await ffmpeg.exec([
       "-hide_banner",
+      ...seek,
       "-i", inputPath,
       "-map", "0:a:0",
       "-vn", "-ac", "1", "-ar", String(OPUS_SAMPLE_RATE),
@@ -140,8 +230,8 @@ async function extractWithFfmpeg(file: File, opts: ExtractOptions): Promise<Engi
     const data = (await ffmpeg.readFile("/out.ogg")) as Uint8Array;
     return {
       audio: new Blob([data as BlobPart], { type: "audio/ogg" }),
-      durationSec: media.durationSec,
-      startOffsetSec: media.startSec,
+      durationSec: opts.range ? Math.max(0, opts.range.end - opts.range.start) : media.durationSec,
+      startOffsetSec: opts.range ? Math.max(0, opts.range.start) : media.startSec,
       engine: "ffmpeg",
     };
   } finally {

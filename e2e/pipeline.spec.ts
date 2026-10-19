@@ -41,13 +41,18 @@ async function runPipeline(
   page: Page,
   file: string,
   engine?: "mediabunny" | "ffmpeg",
-  opts: { withKey?: boolean } = {},
+  opts: { withKey?: boolean; repair?: boolean } = {},
 ) {
   if (opts.withKey !== false) {
     await page.addInitScript((key) => window.localStorage.setItem("vc.geminiApiKey", key), E2E_KEY);
   }
-  // The engine picker moved out of the UI; a query param still forces one for tests.
-  await page.goto(engine ? `/debug?engine=${engine}` : "/debug");
+  // Query params force an engine and disable the multi-request repair, so these
+  // UI tests stay single-request; the repair pass has its own test below.
+  const params = new URLSearchParams();
+  if (engine) params.set("engine", engine);
+  if (!opts.repair) params.set("repair", "off");
+  const qs = params.toString();
+  await page.goto(qs ? `/debug?${qs}` : "/debug");
   await page.getByTestId("file-input").setInputFiles(fixture(file));
   await page.getByRole("button", { name: "Make captions" }).click();
 }
@@ -456,4 +461,49 @@ test("reads back the language Gemini detected, and never sends a hint", async ({
 
   await page.getByTestId("advanced").click();
   await expect(page.getByTestId("detected-language")).toContainText("Devanagari script");
+});
+
+test("re-transcribes the stretches Gemini auto-detect skipped", async ({ page }) => {
+  const durations: number[] = [];
+  let call = 0;
+  await page.route("**/api/transcribe**", async (route) => {
+    const bytes = new Uint8Array(route.request().postDataBuffer() ?? []);
+    const durationSec = oggOpusDuration(bytes);
+    durations.push(durationSec);
+    call++;
+    // Pass 1 hears only the middle of the track; every repair hears a short slice.
+    const words =
+      call === 1
+        ? [{ text: "middle", start: durationSec * 0.5 - 0.05, end: durationSec * 0.5 + 0.05 }]
+        : [
+            { text: "edge-a", start: 0.2, end: 0.7 },
+            { text: "edge-b", start: Math.max(0.8, durationSec - 0.9), end: Math.max(1.2, durationSec - 0.4) },
+          ];
+    await route.fulfill({
+      json: { words, text: words.map((w) => w.text).join(" "), durationSec, model: "mock" },
+    });
+  });
+  await page.route("**/api/spell**", async (route) => {
+    const body = route.request().postDataJSON() as { words: string[] };
+    await route.fulfill({ json: { words: body.words.map(() => null), rejected: body.words.length, model: "mock" } });
+  });
+
+  await runPipeline(page, "speech.mp4", undefined, { repair: true });
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 120_000 });
+
+  // The skipped start/end were picked up by separate, shorter requests.
+  expect(call).toBeGreaterThan(1);
+  expect(durations.some((d) => d < 4)).toBe(true);
+  await expect(page.getByTestId("log")).toContainText("re-transcribing");
+  await expect(page.getByTestId("words")).toContainText("middle");
+  await expect(page.getByTestId("words")).toContainText("edge-a");
+
+  // Repaired words keep their place on the video timeline (chunk offset added),
+  // so at least one sits in the second half of the clip.
+  const starts = await page.getByTestId("words").evaluate((el) =>
+    Array.from(el.querySelectorAll("button")).map((b) =>
+      Number.parseFloat((b.getAttribute("title") ?? "").split("–")[0]),
+    ),
+  );
+  expect(starts.some((s) => s > durations[0] * 0.5)).toBe(true);
 });
