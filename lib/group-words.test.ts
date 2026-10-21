@@ -26,6 +26,22 @@ describe("groupWords", () => {
     expect(cues.map((c) => c.text)).toEqual(["I went home.", "Then I slept."]);
   });
 
+  it("caps cues at four words", () => {
+    const cues = groupWords(speak("one two three four five six seven eight"));
+    expect(cues.map((c) => c.words.length)).toEqual([4, 4]);
+    for (const c of cues) expect(c.words.length).toBeLessThanOrEqual(4);
+  });
+
+  it("splits long speech into 3–4 word cues without a one-word tail", () => {
+    const cues = groupWords(speak("one two three four five six seven eight nine"));
+    expect(cues.map((c) => c.words.length)).toEqual([3, 3, 3]);
+  });
+
+  it("respects a custom maxWords", () => {
+    const cues = groupWords(speak("one two three four five six"), { maxWords: 3 });
+    expect(cues.map((c) => c.words.length)).toEqual([3, 3]);
+  });
+
   it("breaks on long pauses", () => {
     const words = [...speak("first part", 0), ...speak("second part", 3)];
     expect(groupWords(words).map((c) => c.text)).toEqual(["first part", "second part"]);
@@ -68,7 +84,7 @@ describe("groupWords", () => {
   it("removes unambiguous fillers but keeps 'like'", () => {
     const cues = groupWords(speak("um I like uh this"));
     expect(cues[0].text).toBe("I like this");
-    expect(groupWords(speak("um I like uh this"), { removeFillers: false })[0].text).toBe("um I like uh this");
+    expect(groupWords(speak("um I like uh this"), { removeFillers: false, maxWords: 10 })[0].text).toBe("um I like uh this");
   });
 
   it("keeps the sentence break carried by a removed filler", () => {

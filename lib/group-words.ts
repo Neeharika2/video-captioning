@@ -10,6 +10,8 @@ import type { Caption, Word } from "./types";
 export type GroupOptions = {
   maxCharsPerLine: number;
   maxLines: number;
+  /** Most words in one cue. Short-form captions read best at 3–4 words. */
+  maxWords: number;
   /** Reading speed used to hold short cues on screen longer. */
   maxCharsPerSecond: number;
   /** Seconds. */
@@ -24,6 +26,7 @@ export type GroupOptions = {
 export const DEFAULT_GROUP_OPTIONS: GroupOptions = {
   maxCharsPerLine: 42,
   maxLines: 2,
+  maxWords: 4,
   maxCharsPerSecond: 20,
   maxDuration: 6,
   minDuration: 1,
@@ -52,6 +55,7 @@ export function isFiller(text: string) {
 export function groupWords(input: Word[], options: Partial<GroupOptions> = {}): Caption[] {
   const opts = { ...DEFAULT_GROUP_OPTIONS, ...options };
   const maxChars = opts.maxCharsPerLine * opts.maxLines;
+  const maxWords = Math.max(1, opts.maxWords);
   const gap = opts.gapMs / 1000;
 
   // Drop fillers, but keep the sentence break a filler like "um." carried.
@@ -69,11 +73,35 @@ export function groupWords(input: Word[], options: Partial<GroupOptions> = {}): 
   let current: (Word & { breakAfter?: boolean })[] = [];
   let currentChars = 0;
 
-  for (const w of words) {
+  // Balance word counts inside a stretch of speech: `runEnd[i]` is the first
+  // index after the run of words that has no sentence end, long pause or
+  // speaker change in it.
+  const runEnd = new Array<number>(words.length);
+  for (let i = words.length - 1; i >= 0; i--) {
+    const w = words[i];
+    const next = words[i + 1];
+    const endsRun =
+      w.breakAfter ||
+      SENTENCE_END.test(w.text) ||
+      !next ||
+      next.start - w.end > gap ||
+      (next.speaker !== undefined && w.speaker !== undefined && next.speaker !== w.speaker);
+    runEnd[i] = endsRun ? i + 1 : runEnd[i + 1];
+  }
+
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
     if (current.length) {
       const prev = current[current.length - 1];
       const nextChars = currentChars + 1 + w.text.length;
+      // If capping at maxWords would leave only 1–2 words for the rest of the
+      // run, break one word early so the cues stay 3–4 words where possible.
+      const remaining = runEnd[i] - i;
+      const tail = (current.length + remaining) % maxWords;
+      const avoidShortTail = maxWords >= 3 && current.length === maxWords - 1 && (tail === 1 || tail === 2);
       const shouldBreak =
+        current.length >= maxWords ||
+        avoidShortTail ||
         prev.breakAfter ||
         SENTENCE_END.test(prev.text) ||
         w.start - prev.end > gap ||
