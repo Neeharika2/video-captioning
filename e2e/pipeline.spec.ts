@@ -463,6 +463,31 @@ test("reads back the language Gemini detected, and never sends a hint", async ({
   await expect(page.getByTestId("detected-language")).toContainText("Devanagari script");
 });
 
+test("publishes final captions only after the spelling stage", async ({ page }) => {
+  await mockApi(page, [
+    { text: "आप", start: 0.2, end: 0.5 },
+    { text: "कैसे", start: 0.5, end: 0.8 },
+    { text: "हैं", start: 0.8, end: 1.1 },
+  ]);
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  await page.route("**/api/spell**", async (route) => {
+    await gate;
+    const body = route.request().postDataJSON() as { words: string[] };
+    await route.fulfill({ json: { words: body.words.map(() => null), rejected: body.words.length, model: "mock" } });
+  });
+
+  await runPipeline(page, "speech.mp4");
+  // There is no separate visible step: it stays on "Transcribing…" until the
+  // normalized captions are published.
+  await expect(page.getByTestId("status")).toContainText("Transcribing", { timeout: 60_000 });
+  await expect(page.getByTestId("captions")).toHaveCount(0);
+
+  release();
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+  await expect(page.getByTestId("captions")).toContainText("aap");
+});
+
 test("re-transcribes the stretches Gemini auto-detect skipped", async ({ page }) => {
   const durations: number[] = [];
   let call = 0;

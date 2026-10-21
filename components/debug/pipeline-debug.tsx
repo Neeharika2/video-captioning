@@ -267,41 +267,44 @@ export function PipelineDebug() {
 
   const runSpelling = async (source: Word[]) => {
     spellAbortRef.current?.abort();
-    setSpelled(null);
     if (!source.some((w) => hasNonLatinLetters(w.text))) {
       setSpellStatus({ step: "idle" });
       return;
     }
     const abort = new AbortController();
     spellAbortRef.current = abort;
-    const total = source.length;
     const key = getApiKey();
     if (!key) {
       setSpellStatus({ step: "done", warn: true, message: "Add your Gemini API key in Settings to fix spelling." });
       return;
     }
+    const texts = source.map((w) => w.text);
+    // Applied once at the end: the caption list must not flip between the
+    // rule-based and corrected spelling while the user is looking at it.
+    const accumulated = new Array<SpelledWord | null>(source.length).fill(null);
+    let spellingTotal = 0;
     let done = 0;
-    setSpellStatus({ step: "running", done, total });
     const started = Date.now();
     try {
-      const { spellWords } = await import("@/lib/client/spell-client");
-      const summary = await spellWords(
-        source.map((w) => w.text),
-        {
-          apiKey: key,
-          glossary: parseGlossary(settings.glossary),
-          signal: abort.signal,
-          onBatch: (start, results) => {
-            setSpelled((prev) => {
-              const next = prev ? [...prev] : new Array<SpelledWord | null>(total).fill(null);
-              results.forEach((r, k) => (next[start + k] = r));
-              return next;
-            });
-            done += results.length;
-            setSpellStatus({ step: "running", done, total });
-          },
+      const { planBatches, spellWords } = await import("@/lib/client/spell-client");
+      // Only batches with non-Latin text are sent; count those words so the
+      // pipeline percentage reaches 100 instead of stalling on skipped batches.
+      spellingTotal = planBatches(texts)
+        .filter((b) => texts.slice(b.start, b.end).some(hasNonLatinLetters))
+        .reduce((n, b) => n + (b.end - b.start), 0);
+      setSpellStatus({ step: "running", done, total: spellingTotal });
+      const summary = await spellWords(texts, {
+        apiKey: key,
+        glossary: parseGlossary(settings.glossary),
+        signal: abort.signal,
+        onBatch: (start, results) => {
+          results.forEach((r, k) => (accumulated[start + k] = r));
+          done += results.length;
+          setSpellStatus({ step: "running", done, total: spellingTotal });
         },
-      );
+      });
+      if (abort.signal.aborted) return;
+      setSpelled(accumulated);
       const secs = ((Date.now() - started) / 1000).toFixed(1);
       const kept = summary.rejected + summary.failed;
       addLog(
@@ -321,7 +324,11 @@ export function PipelineDebug() {
             },
       );
     } catch (err) {
-      if (abort.signal.aborted) return;
+      if (abort.signal.aborted) {
+        setSpellStatus({ step: "idle" });
+        return;
+      }
+      setSpelled(accumulated);
       setSpellStatus({ step: "done", warn: true, message: `Smart spelling failed: ${(err as Error).message}` });
     }
   };
@@ -456,14 +463,28 @@ export function PipelineDebug() {
     }
 
     const words = mergeWords([collected]);
+    const transcribedMs = Date.now() - startedAt;
+    // Publish the words only after normalization. Otherwise the caption list
+    // would visibly reflow from basic to corrected spelling, and an edit made
+    // in that window could land on a cue whose text has since changed.
+    if (words.some((w) => hasNonLatinLetters(w.text))) {
+      // Keep the "Transcribing…" status up while the normalization pass runs;
+      // it is part of producing the result, not a separate visible step.
+      setStatus({ step: "transcribing", since: Date.now() });
+      await runSpelling(words);
+      if (signal.aborted) {
+        setSpellStatus({ step: "idle" });
+        setStatus({ step: "idle" });
+        return;
+      }
+    }
     setResult({ ...first, words, text: words.map((w) => w.text).join(" "), durationSec: ex.durationSec });
     setWords(words);
     addLog(
-      `Transcribed in ${((Date.now() - startedAt) / 1000).toFixed(1)} s → ${words.length} words ` +
+      `Transcribed in ${(transcribedMs / 1000).toFixed(1)} s → ${words.length} words ` +
         `(${requests} request${requests === 1 ? "" : "s"}, server-measured ${first.durationSec.toFixed(1)} s)`,
     );
     setStatus({ step: "done" });
-    void runSpelling(words);
   };
 
   const run = async () => {
@@ -525,7 +546,10 @@ export function PipelineDebug() {
     const json = JSON.stringify({ ...result, words, spelled, captions }, null, 2);
     downloadText(json, `${file?.name ?? "words"}.words.json`, "application/json");
   };
-  const busy = status.step === "extracting" || status.step === "uploading" || status.step === "transcribing";
+  const busy =
+    status.step === "extracting" ||
+    status.step === "uploading" ||
+    status.step === "transcribing";
   const seek = (t: number) => {
     if (videoRef.current) videoRef.current.currentTime = t;
   };
@@ -687,7 +711,10 @@ export function PipelineDebug() {
             (busy ? (
               <button
                 type="button"
-                onClick={() => abortRef.current?.abort()}
+                onClick={() => {
+                  abortRef.current?.abort();
+                  spellAbortRef.current?.abort();
+                }}
                 className="w-full rounded-full border border-zinc-300 px-5 py-2.5 text-sm font-medium transition hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-900"
               >
                 Cancel
@@ -710,8 +737,8 @@ export function PipelineDebug() {
               {!file
                 ? "Choose a video to get started."
                 : status.step === "done"
-                  ? "No speech was detected in this clip. Check that the video's audio has audible speech, then click Redo captions."
-                  : "Your captions will appear here once you make them."}
+                    ? "No speech was detected in this clip. Check that the video's audio has audible speech, then click Redo captions."
+                    : "Your captions will appear here once you make them."}
             </p>
           ) : (
             <ol className="flex flex-col gap-1" data-testid="captions">
@@ -798,7 +825,9 @@ export function PipelineDebug() {
         <main className="order-1 flex min-h-0 flex-col gap-3 p-4 lg:order-2">
           {status.step !== "idle" && (
             <div className="flex flex-col gap-2.5" data-testid="progress">
-              {status.step !== "done" && status.step !== "error" && (
+              {(status.step === "extracting" ||
+                status.step === "uploading" ||
+                status.step === "transcribing") && (
                 <ProgressBar value={status.step === "transcribing" ? undefined : status.progress} />
               )}
               <StatusLine status={status} elapsedSec={elapsedSec} />
@@ -1023,14 +1052,7 @@ function TabButton({
 }
 
 function SpellStatusLine({ status }: { status: SpellStatus }) {
-  if (status.step === "idle") return null;
-  if (status.step === "running") {
-    return (
-      <p className="text-xs text-zinc-500" data-testid="spell-status">
-        Fixing spelling… {status.total ? Math.round((status.done / status.total) * 100) : 0}%
-      </p>
-    );
-  }
+  if (status.step !== "done") return null;
   return (
     <p
       className={`text-xs ${status.warn ? "text-amber-600 dark:text-amber-400" : "text-emerald-600 dark:text-emerald-400"}`}
