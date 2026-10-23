@@ -8,8 +8,6 @@ import {
   FONT_GROUPS,
   FONT_LABELS,
   LOOP_LABELS,
-  PRESETS,
-  PRESET_CATEGORIES,
   TEXT_CASE_LABELS,
   TREATMENT_LABELS,
   WORDS_PER_CAPTION,
@@ -18,10 +16,11 @@ import {
   sameStyle,
   type CaptionStyle,
   type FontFamily,
-  type Preset,
 } from "@/lib/caption-style";
+import { PRESETS, PRESET_CATEGORIES, type Preset } from "@/lib/caption-presets";
 import { ensureCaptionFont } from "@/lib/client/caption-fonts";
 import { drawCaption } from "@/lib/client/caption-renderer";
+import { subscribeFrame } from "@/lib/client/raf-ticker";
 import type { Caption } from "@/lib/types";
 
 type Props = {
@@ -396,13 +395,16 @@ function Toggle({
 /** A short spoken line the preset cards act out. */
 const DEMO: Caption = {
   id: "demo",
-  text: "Make it pop",
+  text: "Make it pop with 3 tricks",
   start: 0,
-  end: 1.9,
+  end: 2.5,
   words: [
-    { text: "Make", start: 0.1, end: 0.45, alt: "మేక్", speaker: "0" },
-    { text: "it", start: 0.45, end: 0.7, alt: "ఇట్", speaker: "0" },
-    { text: "pop", start: 0.7, end: 1.5, alt: "పాప్", speaker: "1" },
+    { text: "Make", start: 0.15, end: 0.5, alt: "మేక్", speaker: "0" },
+    { text: "it", start: 0.5, end: 0.75, alt: "ఇట్", speaker: "0" },
+    { text: "pop", start: 0.75, end: 1.2, alt: "పాప్", speaker: "1" },
+    { text: "with", start: 1.2, end: 1.45, alt: "విత్", speaker: "1" },
+    { text: "3", start: 1.45, end: 1.7, alt: "3", speaker: "0" },
+    { text: "tricks", start: 1.7, end: 2.3, alt: "ట్రిక్స్", speaker: "0" },
   ],
 };
 
@@ -418,16 +420,23 @@ function demoCaptions(n: number): Caption[] {
   return out;
 }
 /** One play-through of the demo, including a short blank beat before it repeats. */
-const DEMO_LOOP = 2.3;
-/** Resting frame: the last word being spoken, so highlights are visible. */
-const DEMO_REST = 1.2;
+const DEMO_LOOP = 2.9;
+/**
+ * Resting frame: inside the "3 tricks" cue, so a keyword AND the spoken word
+ * both show at once — otherwise every card would read as a still of the same
+ * white line.
+ */
+const DEMO_REST = 1.8;
 
 /**
  * Live miniature of a preset, drawn by the same renderer as the preview and
- * export. Rests on one frame and acts out the effect while hovered.
+ * export. Plays continuously while the card is on screen (or hovered), so the
+ * gallery shows each preset's motion rather than a row of still frames; off
+ * screen it rests on `DEMO_REST`. Every preview shares one animation loop.
  */
 function PresetPreview({ style, playing }: { style: CaptionStyle; playing: boolean }) {
   const ref = useRef<HTMLCanvasElement>(null);
+  const [visible, setVisible] = useState(false);
   const [fontTick, setFontTick] = useState(0);
 
   useEffect(() => {
@@ -437,6 +446,23 @@ function PresetPreview({ style, playing }: { style: CaptionStyle; playing: boole
       live = false;
     };
   }, [style.fontFamily, style.weight]);
+
+  // Animate only what's on screen, so a long gallery never runs dozens of
+  // off-screen canvases.
+  useEffect(() => {
+    const canvas = ref.current;
+    if (!canvas || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) setVisible(entry.isIntersecting);
+      },
+      { threshold: 0.2 },
+    );
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, []);
+
+  const animate = playing || visible;
 
   useEffect(() => {
     const canvas = ref.current;
@@ -461,21 +487,24 @@ function PresetPreview({ style, playing }: { style: CaptionStyle; playing: boole
       const cue = demoCaptions(style.wordsPerCaption).find((c) => t >= c.start && t < c.end);
       if (cue) drawCaption(ctx, cue, w, h, mini, t, { still });
     };
-    if (!playing) {
+    if (!animate) {
       draw(DEMO_REST, true);
       return;
     }
-    let raf = 0;
     const t0 = performance.now();
-    const loop = (now: number) => {
-      draw(((now - t0) / 1000) % DEMO_LOOP, false);
-      raf = requestAnimationFrame(loop);
-    };
-    raf = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(raf);
-  }, [style, playing, fontTick]);
+    return subscribeFrame((now) => draw(((now - t0) / 1000) % DEMO_LOOP, false));
+  }, [style, animate, fontTick]);
 
   return <canvas ref={ref} aria-hidden="true" className="h-full w-full" />;
+}
+
+/** What drives a preset, shown as a small tag on its card. */
+function presetBadge(style: CaptionStyle): string {
+  if (style.bilingual) return "bilingual";
+  if (style.speakerColors) return "speakers";
+  if (style.keywords) return "punchline";
+  if (style.emphasis !== "none") return "spoken";
+  return "block";
 }
 
 function PresetChip({ preset, selected, onSelect }: { preset: Preset; selected: boolean; onSelect: () => void }) {
@@ -497,8 +526,11 @@ function PresetChip({ preset, selected, onSelect }: { preset: Preset; selected: 
           : "border-zinc-200 hover:border-zinc-400 dark:border-zinc-800 dark:hover:border-zinc-600"
       }`}
     >
-      <span className="block h-14 overflow-hidden rounded-lg bg-zinc-900">
+      <span className="relative block h-14 overflow-hidden rounded-lg bg-zinc-900">
         <PresetPreview style={preset.style} playing={playing} />
+        <span className="pointer-events-none absolute top-1 right-1 rounded-full bg-black/50 px-1.5 py-0.5 text-[9px] font-medium tracking-wide text-white/85">
+          {presetBadge(preset.style)}
+        </span>
       </span>
       <span className="px-0.5">
         <span className="block truncate text-[11px] font-medium">{preset.name}</span>

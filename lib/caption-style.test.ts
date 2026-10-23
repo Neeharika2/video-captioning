@@ -14,14 +14,13 @@ import {
   fontSizeFor,
   LOOP_LABELS,
   normalizeStyle,
-  PRESETS,
-  PRESET_CATEGORIES,
   sameStyle,
   speakerColor,
   styleForCaption,
   withAlpha,
   WORD_MOTION_LABELS,
 } from "./caption-style";
+import { PRESETS, PRESET_CATEGORIES } from "./caption-presets";
 
 describe("caption styles", () => {
   it("ships twenty-two distinct, well-formed presets", () => {
