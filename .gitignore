@@ -42,6 +42,7 @@ PLAN.md
 PLAN.v2.md
 PLAN.v3.md
 PLAN.v4.md
+PLAN.presets.md
 
 # benchmark: private audio, cache and raw results
 /benchmark/.cache/

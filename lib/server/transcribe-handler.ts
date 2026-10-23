@@ -1,5 +1,5 @@
 import "server-only";
-import { type ApiError, type ApiErrorCode, type TranscribeResponse } from "../api-types";
+import { SPEAKERS_HEADER, type ApiError, type ApiErrorCode, type TranscribeResponse } from "../api-types";
 import { GeminiError, formatWait, transcribe as geminiTranscribe } from "../gemini";
 import { OggOpusError, oggOpusDuration } from "../ogg-duration";
 import type { Word } from "../types";
@@ -77,6 +77,8 @@ export async function handleTranscribe(request: Request, deps: HandlerDeps = {})
       audio,
       mimeType: "audio/ogg",
       timestamps: true,
+      // Speaker labels only when asked: they're for per-speaker colours.
+      diarization: request.headers.get(SPEAKERS_HEADER) === "1",
       signal: request.signal,
       // Leave headroom under the route's maxDuration for parsing + response.
       timeoutMs: 270_000,

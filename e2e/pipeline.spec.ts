@@ -1,5 +1,5 @@
 import path from "node:path";
-import { expect, test, type Locator, type Page } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import type { TranscribeResponse } from "../lib/api-types";
 import { oggOpusDuration } from "../lib/ogg-duration";
 import { FIXTURES } from "./global-setup";
@@ -29,13 +29,6 @@ async function mockApi(page: Page, words = [{ text: "Hello", start: 0.2, end: 0.
 
 /** Shape-valid fake key so the client-side "missing key" guard passes. */
 const E2E_KEY = "AIzaSyE2E-test-key_0123456789";
-
-/** Computed glyph outline width in px, used to assert the outline axis. */
-function strokeWidthOf(locator: Locator): Promise<number> {
-  return locator.evaluate(
-    (el) => parseFloat(getComputedStyle(el).getPropertyValue("-webkit-text-stroke-width")) || 0,
-  );
-}
 
 async function runPipeline(
   page: Page,
@@ -271,19 +264,67 @@ test("style presets apply their look to the preview", async ({ page }) => {
   const block = page.getByTestId("overlay").locator("[data-caption-block]");
   await expect(block).toBeVisible();
 
-  // Bold Viral uppercases the text via CSS and strokes the glyphs (outline axis).
+  // Bold Viral uppercases the text and strokes the glyphs (outline axis).
   await page.getByRole("button", { name: "Bold Viral" }).click();
   await expect(block).toHaveCSS("text-transform", "uppercase");
-  expect(await strokeWidthOf(block)).toBeGreaterThan(0);
+  await expect(block).toHaveAttribute("data-outline", "true");
+  await expect(block).toHaveAttribute("data-animate-by", "word");
 
-  // Soft Aesthetic paints the pastel pill from `boxColor` + `boxOpacity`, no outline.
+  // Soft Aesthetic paints a pastel pill, no outline, and floats.
   await page.getByRole("button", { name: "Soft Aesthetic" }).click();
-  await expect(block).toHaveCSS("background-color", "rgba(252, 231, 243, 0.92)");
-  expect(await strokeWidthOf(block)).toBe(0);
+  await expect(block).toHaveAttribute("data-treatment", "box");
+  await expect(block).toHaveAttribute("data-outline", "false");
+  await expect(block).toHaveAttribute("data-loop", "float");
 
   // Outline is its own axis, so it layers onto any preset.
   await page.getByRole("checkbox", { name: "Outline" }).check();
-  expect(await strokeWidthOf(block)).toBeGreaterThan(0);
+  await expect(block).toHaveAttribute("data-outline", "true");
+});
+
+test("words on screen regroups the captions", async ({ page }) => {
+  await mockApi(page);
+  await runPipeline(page, "speech.mp4");
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+
+  const timeline = page.getByTestId("timeline");
+  await expect(timeline.getByRole("button", { name: /Hello everyone/ })).toHaveCount(1);
+
+  // Big Word shows one word at a time, so the cue splits in two.
+  await page.getByRole("button", { name: "Big Word" }).click();
+  await expect(timeline.getByRole("button", { name: /Hello everyone/ })).toHaveCount(0);
+  await expect(timeline.getByRole("button", { name: /Hello/ })).toHaveCount(1);
+  await expect(timeline.getByRole("button", { name: /everyone/ })).toHaveCount(1);
+
+  // Back to four words: one cue again.
+  await page.getByRole("group", { name: "Words on screen" }).getByRole("button", { name: "4" }).click();
+  await expect(timeline.getByRole("button", { name: /Hello everyone/ })).toHaveCount(1);
+});
+
+test("effects can be mixed and the caption is painted on the canvas", async ({ page }) => {
+  await mockApi(page);
+  await runPipeline(page, "speech.mp4");
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+
+  await page.getByTestId("captions").getByRole("button").first().click();
+  const block = page.getByTestId("overlay").locator("[data-caption-block]");
+  await expect(block).toBeVisible();
+
+  await page.getByRole("group", { name: "Spoken word" }).getByRole("button", { name: "Box" }).click();
+  await page.getByRole("group", { name: "Loop" }).getByRole("button", { name: "Wave" }).click();
+  await page.getByRole("group", { name: "Animate by" }).getByRole("button", { name: "Letter" }).click();
+  await expect(block).toHaveAttribute("data-emphasis", "box");
+  await expect(block).toHaveAttribute("data-loop", "wave");
+  await expect(block).toHaveAttribute("data-animate-by", "letter");
+
+  // The visible caption comes from the canvas, not the (transparent) text.
+  await expect(block).toHaveCSS("color", "rgba(0, 0, 0, 0)");
+  const painted = await page.getByTestId("caption-canvas").evaluate((c: HTMLCanvasElement) => {
+    const data = c.getContext("2d")!.getImageData(0, 0, c.width, c.height).data;
+    let n = 0;
+    for (let i = 3; i < data.length; i += 4) if (data[i] > 0) n++;
+    return n;
+  });
+  expect(painted).toBeGreaterThan(100);
 });
 
 test("the font picker previews each face in its own style", async ({ page }) => {

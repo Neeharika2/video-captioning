@@ -6,6 +6,8 @@ export type Word = {
   start: number;
   end: number;
   speaker?: string;
+  /** The same word in the other script (original ↔ English letters), for bilingual captions. */
+  alt?: string;
 };
 
 export type Caption = {

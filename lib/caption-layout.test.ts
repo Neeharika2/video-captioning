@@ -44,15 +44,38 @@ describe("caption layout", () => {
     expect(layout.fontSize).toBeLessThan(fontSizeFor(style, 1000, 1000));
   });
 
-  it("uppercases before measuring and returns uppercase lines", () => {
-    const layout = layoutCaption(
-      { ...DEFAULT_STYLE, uppercase: true },
-      cue("hello world", ["hello", "world"]),
-      1000,
-      1000,
-      measure,
-    );
-    expect(layout.lines).toEqual(["HELLO", "WORLD"]);
+  it("upper- or lowercases before measuring", () => {
+    const upper = layoutCaption({ ...DEFAULT_STYLE, textCase: "upper" }, cue("hello world", ["hello", "world"]), 1000, 1000, measure);
+    expect(upper.lines).toEqual(["HELLO", "WORLD"]);
+    const lower = layoutCaption({ ...DEFAULT_STYLE, textCase: "lower" }, cue("Hello World", ["Hello", "World"]), 1000, 1000, measure);
+    expect(lower.lines).toEqual(["hello", "world"]);
+  });
+
+  it("measures weight-shift captions at the bold weight", () => {
+    const fonts: string[] = [];
+    layoutCaption({ ...DEFAULT_STYLE, emphasis: "weight", weight: 300 }, cue("hello"), 1000, 1000, (text, font) => {
+      fonts.push(font);
+      return measure(text, font);
+    });
+    expect(fonts.every((f) => f.startsWith("800 "))).toBe(true);
+  });
+
+  it("adds a smaller line in the other script for bilingual captions", () => {
+    const c: Caption = {
+      ...cue("ela unnaru"),
+      words: [
+        { text: "ela", start: 0, end: 0.5, alt: "ఎలా" },
+        { text: "unnaru", start: 0.5, end: 1, alt: "ఉన్నారు" },
+      ],
+    };
+    const layout = layoutCaption({ ...DEFAULT_STYLE, bilingual: true }, c, 1000, 1000, measure);
+    expect(layout.sub?.lines).toEqual(["ఎలా ఉన్నారు"]);
+    expect(layout.sub!.fontSize).toBeLessThan(layout.fontSize);
+    // Off, or nothing different to show: no second line.
+    expect(layoutCaption(DEFAULT_STYLE, c, 1000, 1000, measure).sub).toBeUndefined();
+    expect(layoutCaption({ ...DEFAULT_STYLE, bilingual: true }, { ...c, text: "edited" }, 1000, 1000, measure).sub).toBeUndefined();
+    const same: Caption = { ...c, words: c.words.map((w) => ({ ...w, alt: w.text })) };
+    expect(layoutCaption({ ...DEFAULT_STYLE, bilingual: true }, same, 1000, 1000, measure).sub).toBeUndefined();
   });
 
   it("wraps greedily at word boundaries", () => {

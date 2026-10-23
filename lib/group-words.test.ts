@@ -119,3 +119,16 @@ describe("isFiller", () => {
     expect(isFiller("umbrella")).toBe(false);
   });
 });
+
+describe("groupWords: per-word extras", () => {
+  it("keeps each word's other-script spelling and speaker", () => {
+    const [cue] = groupWords([
+      { text: "ela", start: 0, end: 0.4, alt: "ఎలా", speaker: "0" },
+      { text: "unnaru", start: 0.4, end: 0.9, alt: "ఉన్నారు", speaker: "0" },
+    ]);
+    expect(cue.words.map((w) => [w.alt, w.speaker])).toEqual([
+      ["ఎలా", "0"],
+      ["ఉన్నారు", "0"],
+    ]);
+  });
+});

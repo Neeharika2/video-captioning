@@ -10,6 +10,9 @@ export const TRANSCRIBE_PATH = "/api/transcribe";
  */
 export const API_KEY_HEADER = "x-gemini-api-key";
 
+/** "1" asks for speaker labels on every word (for per-speaker caption colours). */
+export const SPEAKERS_HEADER = "x-detect-speakers";
+
 export type TranscribeResponse = {
   /** Chunk-local times in seconds. */
   words: Word[];

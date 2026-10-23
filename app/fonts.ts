@@ -10,10 +10,13 @@
  * the shared options are repeated rather than spread.
  */
 import {
+  Anton,
   Archivo_Black,
   Audiowide,
+  Bangers,
   Bowlby_One_SC,
   Bungee,
+  Chewy,
   DM_Serif_Display,
   Inter,
   Lilita_One,
@@ -93,6 +96,10 @@ const monoton = Monoton({
   variable: "--font-monoton",
 });
 
+const anton = Anton({ subsets: ["latin"], display: "swap", preload: false, weight: "400", variable: "--font-anton" });
+const bangers = Bangers({ subsets: ["latin"], display: "swap", preload: false, weight: "400", variable: "--font-bangers" });
+const chewy = Chewy({ subsets: ["latin"], display: "swap", preload: false, weight: "400", variable: "--font-chewy" });
+
 /**
  * Applied once on the root layout so next/font emits the self-hosted
  * `@font-face` rules for every caption face.
@@ -111,6 +118,9 @@ export const captionFontVariables = [
   syne,
   dmSerifDisplay,
   monoton,
+  anton,
+  bangers,
+  chewy,
 ]
   .map((font) => font.variable)
   .join(" ");

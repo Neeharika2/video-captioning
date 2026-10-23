@@ -4,6 +4,7 @@
  */
 import {
   API_KEY_HEADER,
+  SPEAKERS_HEADER,
   TRANSCRIBE_PATH,
   type ApiError,
   type TranscribeResponse,
@@ -34,6 +35,8 @@ export type TranscribeClientOptions = {
   maxAttempts?: number;
   /** Per attempt. Default 295 s (route limit is 300 s). */
   timeoutMs?: number;
+  /** Ask for speaker labels on every word. */
+  speakers?: boolean;
 };
 
 export async function transcribeChunk(audio: Blob, opts: TranscribeClientOptions): Promise<TranscribeResponse> {
@@ -61,6 +64,7 @@ function send(audio: Blob, opts: TranscribeClientOptions): Promise<TranscribeRes
     xhr.open("POST", TRANSCRIBE_PATH);
     xhr.setRequestHeader("content-type", "audio/ogg");
     xhr.setRequestHeader(API_KEY_HEADER, opts.apiKey);
+    if (opts.speakers) xhr.setRequestHeader(SPEAKERS_HEADER, "1");
     xhr.responseType = "json";
     xhr.timeout = opts.timeoutMs ?? 295_000;
 

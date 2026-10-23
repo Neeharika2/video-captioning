@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { API_KEY_HEADER, type ApiError, type TranscribeResponse } from "../api-types";
+import { API_KEY_HEADER, SPEAKERS_HEADER, type ApiError, type TranscribeResponse } from "../api-types";
 import { GeminiError, type TranscribeRequest, type TranscribeResult } from "../gemini";
 import type { ServerConfig } from "./config";
 import { MemoryLimiter } from "./limits";
@@ -82,6 +82,16 @@ describe("handleTranscribe", () => {
     const sent = transcribe.mock.calls[0][0];
     expect(sent).toMatchObject({ apiKey: TEST_KEY, timestamps: true });
     expect(sent).not.toHaveProperty("languageCodes");
+  });
+
+  it("asks for speaker labels only when the caller opts in", async () => {
+    const transcribe = vi.fn<(req: TranscribeRequest) => Promise<TranscribeResult>>(async () => okResult());
+    await call(request(ogg5s), { transcribe });
+    expect(transcribe.mock.calls[0][0].diarization).toBe(false);
+    const withSpeakers = request(ogg5s);
+    withSpeakers.headers.set(SPEAKERS_HEADER, "1");
+    await call(withSpeakers, { transcribe });
+    expect(transcribe.mock.calls[1][0].diarization).toBe(true);
   });
 
   it("spreads a transcript that came back without word timings", async () => {

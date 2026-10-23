@@ -11,21 +11,18 @@ import {
   useState,
 } from "react";
 import {
-  ANIMATION_SECONDS,
   MAX_CAPTION_SCALE,
   MIN_CAPTION_SCALE,
-  captionEnter,
   fontStack,
   fontSizeFor,
   styleForCaption,
-  withAlpha,
   type CaptionPlacement,
   type CaptionPosition,
   type CaptionStyle,
 } from "@/lib/caption-style";
 import { layoutCaption } from "@/lib/caption-layout";
 import { ensureCaptionFont } from "@/lib/client/caption-fonts";
-import { findCaptionAt, spokenWordAt } from "@/lib/client/caption-renderer";
+import { drawCaption, findCaptionAt } from "@/lib/client/caption-renderer";
 import type { Caption } from "@/lib/types";
 
 /** Placeholder shown only when there are no captions on screen and the video is paused. */
@@ -72,9 +69,10 @@ type Props = {
  *
  * The stage is sized to the video's own aspect ratio (read from the file, not
  * assumed), so nothing is letterboxed and the overlay covers exactly the frame —
- * the same area the burned-in export draws on. Each caption can be dragged to
- * its own spot and resized from its corners; placement, size, line breaks and
- * the appearance animation all match the export.
+ * the same area the burned-in export draws on. Captions are painted on a canvas
+ * by the export's own `drawCaption`, so every effect looks identical in both.
+ * An invisible copy of the caption text sits on top as the drag / resize
+ * handle (and keeps the caption readable to screen readers and tests).
  */
 export function CaptionPlayer({
   src,
@@ -89,6 +87,9 @@ export function CaptionPlayer({
   onSyncPlacement,
 }: Props) {
   const stageRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  /** Latest paint function, so the playback loop always draws with current props. */
+  const paintRef = useRef<() => void>(() => {});
   const blockRef = useRef<HTMLDivElement>(null);
   const trackRef = useRef<TextTrack | null>(null);
   const dragRef = useRef<{
@@ -110,14 +111,13 @@ export function CaptionPlayer({
   } | null>(null);
   const placementRef = useRef(onPlacement);
   const scaleRef = useRef(onScale);
-  const [pos, setPos] = useState({ cue: -1, word: -1, age: Infinity, sample: false });
+  const [pos, setPos] = useState({ cue: -1, sample: false });
   const [box, setBox] = useState({ w: 0, h: 0 });
   const [ratio, setRatio] = useState(16 / 9);
   const [dragging, setDragging] = useState(false);
   const [resizing, setResizing] = useState(false);
   // Bumped when a webfont finishes loading, so the memoised layout re-measures.
   const [fontsReady, setFontsReady] = useState(0);
-  const emphasize = style.emphasis === "highlight";
 
   useEffect(() => {
     placementRef.current = onPlacement;
@@ -178,8 +178,8 @@ export function CaptionPlayer({
     };
   }, [videoRef, src]);
 
-  // Follow playback. Re-render when the visible cue, spoken word, appearance
-  // animation, or the on-screen sample changes.
+  // Follow playback: repaint the canvas every frame while playing, and
+  // re-render only when the visible cue or the placement sample changes.
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -187,19 +187,11 @@ export function CaptionPlayer({
     const update = () => {
       const t = video.currentTime;
       const cue = findCaptionAt(captions, t);
-      const word = emphasize && cue >= 0 ? spokenWordAt(captions[cue], t) : -1;
-      // Animate only while playing: pausing or seeking shows the resting look
-      // (and makes the caption easy to grab, drag and resize).
-      const raw = cue >= 0 && !video.paused ? t - captions[cue].start : Infinity;
-      const age = raw < ANIMATION_SECONDS ? raw : Infinity;
       // Only offer the placement sample before the first cue (or with no
       // captions at all) — never inside a gap, which would look like a real cue.
       const sample = video.paused && cue < 0 && (captions.length === 0 || t < captions[0].start);
-      setPos((prev) =>
-        prev.cue === cue && prev.word === word && prev.age === age && prev.sample === sample
-          ? prev
-          : { cue, word, age, sample },
-      );
+      setPos((prev) => (prev.cue === cue && prev.sample === sample ? prev : { cue, sample }));
+      paintRef.current();
     };
     const loop = () => {
       update();
@@ -220,7 +212,7 @@ export function CaptionPlayer({
       video.removeEventListener("pause", update);
       for (const e of events) video.removeEventListener(e, update);
     };
-  }, [videoRef, src, captions, emphasize]);
+  }, [videoRef, src, captions]);
 
   // Native caption track, shown only when the <video> itself is fullscreen
   // (the overlay can't follow it there).
@@ -331,15 +323,53 @@ export function CaptionPlayer({
 
   const fontSize = layout ? layout.fontSize : stageW ? fontSizeFor(effStyle, stageW, stageH) : 16;
   const lines = layout ? layout.lines : showGhost ? [SAMPLE_TEXT] : [];
-  const tokens = lines.map((line) => line.split(/\s+/).filter(Boolean));
-  const canHighlight = emphasize && !!cue && pos.word >= 0 && tokens.flat().length === cue.words.length;
-  // Index of each line's first word within the cue.
-  const lineStarts = tokens.map((_, i) => tokens.slice(0, i).reduce((n, t) => n + t.length, 0));
+
+  // Paint the frame at the video's current time. Reads the clock directly, so
+  // the playback loop can call it every frame without re-rendering React.
+  const paint = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const dpr = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
+    const w = Math.max(1, Math.round(stageW * dpr));
+    const h = Math.max(1, Math.round(stageH * dpr));
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    if (stageW <= 0 || stageH <= 0) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const video = videoRef.current;
+    const t = video?.currentTime ?? 0;
+    // Effects play while the video plays; paused or scrubbing shows the resting
+    // look, so the caption is easy to read, grab, drag and resize.
+    const still = !video || video.paused;
+    const i = findCaptionAt(captions, t);
+    if (i >= 0) {
+      const c = captions[i];
+      drawCaption(ctx, c, stageW, stageH, styleForCaption(style, c.placement, c.scale), t, { still });
+    } else if (interactive && still && (captions.length === 0 || t < captions[0].start)) {
+      const sample = { id: "sample", text: SAMPLE_TEXT, start: t, end: t + 1, words: [] };
+      drawCaption(ctx, sample, stageW, stageH, style, t, { still: true });
+    }
+  };
+
+  // Repaint after every render (style, captions, size or fonts changed) and
+  // hand the playback loop the latest paint function.
+  useLayoutEffect(() => {
+    paintRef.current = paint;
+    paint();
+  });
 
   const margin = Math.round(stageH * 0.07);
   const alignItems =
     effStyle.position === "top" ? "flex-start" : effStyle.position === "middle" ? "center" : "flex-end";
-  const enter = cue ? captionEnter(style.animation, pos.age) : { opacity: 1, scale: 1, shiftY: 0 };
+  // The canvas paints the caption; this block only mirrors its size and spot so
+  // it can be grabbed. Same font, size and line breaks, but invisible ink.
   const blockStyle: CSSProperties = {
     position: "relative",
     maxWidth: "100%",
@@ -348,13 +378,10 @@ export function CaptionPlayer({
     fontWeight: style.weight,
     lineHeight: 1.3,
     textAlign: "center",
-    textTransform: style.uppercase ? "uppercase" : undefined,
-    color: style.textColor,
-    transform: `translate(${effStyle.offsetX * stageW}px, ${effStyle.offsetY * stageH + enter.shiftY * stageH}px)${
-      enter.scale !== 1 ? ` scale(${enter.scale})` : ""
-    }`,
-    transformOrigin: "center",
-    opacity: enter.opacity,
+    textTransform: style.textCase === "upper" ? "uppercase" : style.textCase === "lower" ? "lowercase" : undefined,
+    color: "transparent",
+    userSelect: "none",
+    transform: `translate(${effStyle.offsetX * stageW}px, ${effStyle.offsetY * stageH}px)`,
     pointerEvents: interactive ? "auto" : "none",
   };
   if (interactive) {
@@ -362,18 +389,8 @@ export function CaptionPlayer({
     blockStyle.touchAction = "none";
   }
   if (style.treatment === "box") {
-    blockStyle.background = withAlpha(style.boxColor, style.boxOpacity);
+    // Match the painted pill so the whole box is grabbable.
     blockStyle.padding = `${Math.round(fontSize * 0.3)}px ${Math.round(fontSize * 0.5)}px`;
-    blockStyle.borderRadius = Math.round(fontSize * 0.35);
-  } else if (style.treatment === "shadow") {
-    blockStyle.textShadow = `0 ${Math.max(1, Math.round(fontSize * 0.08))}px ${Math.max(2, Math.round(fontSize * 0.35))}px rgba(0, 0, 0, 0.65)`;
-  } else if (style.treatment === "glow") {
-    blockStyle.textShadow = `0 0 ${Math.max(4, Math.round(fontSize * 0.55))}px ${style.highlightColor}`;
-  }
-  if (style.outline) {
-    blockStyle.WebkitTextStrokeWidth = `${Math.max(1, fontSize * 0.06)}px`;
-    blockStyle.WebkitTextStrokeColor = "rgba(0, 0, 0, 0.9)";
-    blockStyle.paintOrder = "stroke";
   }
   if (showGhost) {
     blockStyle.outline = "1px dashed rgba(255, 255, 255, 0.55)";
@@ -495,6 +512,12 @@ export function CaptionPlayer({
           style={stageW ? { width: stageW, height: stageH } : undefined}
         >
           <video ref={videoRef} src={src} controls playsInline className="h-full w-full" />
+          <canvas
+            ref={canvasRef}
+            aria-hidden="true"
+            data-testid="caption-canvas"
+            className="pointer-events-none absolute inset-0 h-full w-full"
+          />
           {(cue || showGhost) && (
             <div
               className="pointer-events-none absolute inset-0 flex justify-center px-[6%]"
@@ -506,6 +529,18 @@ export function CaptionPlayer({
                 style={blockStyle}
                 data-caption-block
                 data-animation={style.animation}
+                data-animate-by={style.animateBy}
+                data-emphasis={style.emphasis}
+                data-word-motion={style.wordMotion}
+                data-loop={style.loop}
+                data-treatment={style.treatment}
+                data-outline={style.outline ? "true" : "false"}
+                data-text-case={style.textCase}
+                data-words-per-caption={style.wordsPerCaption}
+                data-keywords={style.keywords ? "true" : "false"}
+                data-gradient={style.gradient ? "true" : "false"}
+                data-bilingual={style.bilingual ? "true" : "false"}
+                data-speaker-colors={style.speakerColors ? "true" : "false"}
                 data-offset-x={round(effStyle.offsetX, 4)}
                 data-offset-y={round(effStyle.offsetY, 4)}
                 data-scale={round(effStyle.scale, 4)}
@@ -523,17 +558,12 @@ export function CaptionPlayer({
                 )}
                 {lines.map((line, i) => (
                   <span key={i} className="block">
-                    {canHighlight
-                      ? tokens[i].map((tok, k) => (
-                          <span
-                            key={k}
-                            style={lineStarts[i] + k === pos.word ? { color: style.highlightColor } : undefined}
-                          >
-                            {k > 0 ? " " : ""}
-                            {tok}
-                          </span>
-                        ))
-                      : line}
+                    {line}
+                  </span>
+                ))}
+                {layout?.sub?.lines.map((line, i) => (
+                  <span key={`sub-${i}`} className="block" style={{ fontSize: layout.sub?.fontSize, fontWeight: Math.min(style.weight, 600) }}>
+                    {line}
                   </span>
                 ))}
                 {interactive &&

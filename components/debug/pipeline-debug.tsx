@@ -22,12 +22,13 @@ import {
 import { downloadText } from "@/lib/client/save-file";
 import { offsetWords, TranscribeError } from "@/lib/client/transcribe-client";
 import { clearApiKey, getApiKey, setApiKey as storeApiKey } from "@/lib/client/api-key";
+import { numberSpeakers } from "@/lib/caption-effects";
 import { detectLanguage, formatLanguage } from "@/lib/detect-language";
 import { DEFAULT_GROUP_OPTIONS, groupWords, wrapLines } from "@/lib/group-words";
 import { hasNonLatinLetters, romanize } from "@/lib/romanize";
 import { latinPunctuation, parseGlossary, type SpelledWord } from "@/lib/spelling";
 import type { Word } from "@/lib/types";
-import { DEFAULT_STYLE, type CaptionPlacement, type CaptionStyle } from "@/lib/caption-style";
+import { DEFAULT_STYLE, normalizeStyle, type CaptionPlacement, type CaptionStyle } from "@/lib/caption-style";
 import { CaptionPlayer } from "./caption-player";
 import { ExportMenu } from "./export-menu";
 import { ApiKeyField } from "./api-key-field";
@@ -70,6 +71,8 @@ type Settings = {
   script: CaptionScript;
   /** Terms to spell exactly, comma or newline separated. */
   glossary: string;
+  /** Ask transcription for speaker labels (for speaker colours). */
+  speakers: boolean;
 };
 
 type SpellStatus =
@@ -82,21 +85,17 @@ function loadSettings(): Settings {
     style: DEFAULT_STYLE,
     script: "roman",
     glossary: "",
+    speakers: false,
   };
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}") as Partial<Settings>;
-    // Older saves used a single "outline" treatment; outline is now its own axis.
-    const legacyOutline = (saved.style as { treatment?: string } | undefined)?.treatment === "outline";
-    const style: CaptionStyle = { ...fallback.style, ...(saved.style ?? {}) };
-    if (legacyOutline) {
-      style.treatment = "plain";
-      style.outline = true;
-    }
     return {
-      style,
+      // Validated and upgraded from older saves (new effect settings get defaults).
+      style: normalizeStyle(saved.style, fallback.style),
       // Not restored: captions always start in English letters.
       script: fallback.script,
       glossary: typeof saved.glossary === "string" ? saved.glossary : fallback.glossary,
+      speakers: typeof saved.speakers === "boolean" ? saved.speakers : fallback.speakers,
     };
   } catch {
     return fallback;
@@ -162,14 +161,19 @@ export function PipelineDebug() {
   const detected = useMemo(() => detectLanguage(words.map((w) => w.text)), [words]);
   // Same words and timings, only respelled. Smart spelling wins where it
   // passed its checks; otherwise the instant rule-based spelling is used.
+  // Each word also carries its spelling in the other script (`alt`) for the
+  // bilingual caption line, and speakers are numbered 0, 1, … by first appearance.
   const displayWords = useMemo(
     () =>
-      words.map((w, i): Word => {
-        const sp = spelled?.[i];
-        if (settings.script === "roman") return { ...w, text: sp ? sp.text : latinPunctuation(romanize(w.text)) };
-        // Original script, but English words back in English spelling.
-        return sp?.english ? { ...w, text: sp.text } : w;
-      }),
+      numberSpeakers(
+        words.map((w, i): Word => {
+          const sp = spelled?.[i];
+          const roman = sp ? sp.text : latinPunctuation(romanize(w.text));
+          if (settings.script === "roman") return { ...w, text: roman, alt: w.text };
+          // Original script, but English words back in English spelling.
+          return { ...w, text: sp?.english ? sp.text : w.text, alt: roman };
+        }),
+      ),
     [words, spelled, settings.script],
   );
   /** User text edits, per cue id. Cleared whenever the captions are rebuilt. */
@@ -184,7 +188,16 @@ export function PipelineDebug() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   // Caption cues on the video timeline, built from the word timings.
-  const baseCaptions = useMemo(() => groupWords(displayWords), [displayWords]);
+  // Ids carry the words-per-caption setting, so edits, timings and placements
+  // made at one grouping never land on a different cue at another.
+  const wordsPerCaption = settings.style.wordsPerCaption;
+  const baseCaptions = useMemo(
+    () =>
+      groupWords(displayWords, { maxWords: wordsPerCaption }).map((c) =>
+        wordsPerCaption === DEFAULT_GROUP_OPTIONS.maxWords ? c : { ...c, id: `${c.id}-of-${wordsPerCaption}` },
+      ),
+    [displayWords, wordsPerCaption],
+  );
   // Text and timing edits win over the derived cues; edited text is re-wrapped
   // to keep the two-line layout. Dragging clamps cues between their neighbours,
   // so the list stays sorted for `findCaptionAt`.
@@ -378,6 +391,7 @@ export function PipelineDebug() {
       const res = await transcribeChunk(blob, {
         apiKey,
         signal,
+        speakers: settings.speakers,
         onUploadProgress: (p) =>
           setStatus((prev) => {
             if (p < 1) return { step: "uploading", progress: p };
@@ -893,6 +907,22 @@ export function PipelineDebug() {
                   : "Detected automatically from the audio — Hindi, Telugu, English and mixed speech all work."}
               </p>
             </div>
+
+            <label className="flex items-start justify-between gap-3">
+              <span className="flex flex-col gap-0.5">
+                <span className="font-medium">Detect speakers</span>
+                <span className="text-xs text-zinc-500">
+                  Label who is speaking, so Speaker colours can give each person their own colour. Applies to the next
+                  transcription.
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                checked={settings.speakers}
+                onChange={(e) => setSettings({ ...settings, speakers: e.target.checked })}
+                className="mt-1 h-4 w-4 shrink-0 accent-zinc-900 dark:accent-zinc-100"
+              />
+            </label>
 
             <div className="flex flex-col gap-3">
               <label className="flex flex-col gap-1.5">

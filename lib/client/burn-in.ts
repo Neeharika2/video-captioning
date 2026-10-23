@@ -9,7 +9,7 @@
 import { styleForCaption, type CaptionStyle } from "../caption-style";
 import type { Caption } from "../types";
 import { ensureCaptionFont } from "./caption-fonts";
-import { drawCaption, findCaptionAt, spokenWordAt } from "./caption-renderer";
+import { drawCaption, findCaptionAt } from "./caption-renderer";
 import type { SaveTarget } from "./save-file";
 
 export type BurnInOptions = {
@@ -81,11 +81,9 @@ export async function burnInCaptions(
           // Caption times are on the video timeline, same as frame timestamps.
           const i = findCaptionAt(sorted, sample.timestamp);
           if (i >= 0) {
-            const t = sample.timestamp;
             const cue = sorted[i];
-            const word = opts.style.emphasis === "highlight" ? spokenWordAt(cue, t) : -1;
-            // Per-cue placement + appearance animation, exactly as in the preview.
-            drawCaption(ctx, cue, canvas.width, canvas.height, styleForCaption(opts.style, cue.placement, cue.scale), word, t - cue.start);
+            // Per-cue placement and every effect, drawn exactly as in the preview.
+            drawCaption(ctx, cue, canvas.width, canvas.height, styleForCaption(opts.style, cue.placement, cue.scale), sample.timestamp);
           }
           return canvas;
         },

@@ -129,7 +129,13 @@ export function groupWords(input: Word[], options: Partial<GroupOptions> = {}): 
       text,
       start: ws[0].start,
       end: Math.max(ws[ws.length - 1].end, ws[0].start + 0.1),
-      words: ws.map(({ text, start, end, speaker }) => ({ text, start, end, ...(speaker ? { speaker } : {}) })),
+      words: ws.map(({ text, start, end, speaker, alt }) => ({
+        text,
+        start,
+        end,
+        ...(speaker ? { speaker } : {}),
+        ...(alt ? { alt } : {}),
+      })),
       lines: wrapLines(text, opts.maxCharsPerLine, opts.maxLines),
     };
   });
