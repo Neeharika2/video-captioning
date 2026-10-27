@@ -73,14 +73,11 @@ export function StylePicker({ style, onChange, hasPlacements = false, onResetPla
           </Field>
         )}
 
-        <div className="grid grid-cols-2 gap-2">
-          <Swatch label="Text" value={style.textColor} onChange={(textColor) => patch({ textColor })} />
-          <Swatch
-            label="Highlight"
-            value={style.highlightColor}
-            onChange={(highlightColor) => patch({ highlightColor })}
-          />
-        </div>
+        <ColourPicker
+          textColor={style.textColor}
+          highlightColor={style.highlightColor}
+          onChange={patch}
+        />
         {!highlightUsed && (
           <p className="-mt-2 text-xs text-zinc-400 dark:text-zinc-500">
             This preset doesn&rsquo;t use the highlight colour — try Karaoke, Word Tiles or a punchline preset.
@@ -249,23 +246,189 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-function Swatch({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
-  return (
-    <label className="flex items-center justify-between gap-2 rounded-lg border border-zinc-200 px-2.5 py-2 dark:border-zinc-800">
+/**
+ * Normalise a typed colour to `#rrggbb`, accepting `abc`, `#abc`, `AABBCC`
+ * or `#AABBCC`. Returns `null` while the text is still incomplete, so the
+ * field can be typed into without fighting the user.
+ */
+function toHex(input: string): string | null {
+  const raw = input.trim().replace(/^#/, "").toLowerCase();
+  if (/^[0-9a-f]{3}$/.test(raw)) return `#${raw[0]}${raw[0]}${raw[1]}${raw[1]}${raw[2]}${raw[2]}`;
+  if (/^[0-9a-f]{6}$/.test(raw)) return `#${raw}`;
+  return null;
+}
+
+/** The colours offered as one-tap swatches, in warm-to-cool order. */
+const QUICK_COLOURS = [
+  "#ffffff",
+  "#f8fafc",
+  "#a1a1aa",
+  "#3f3f46",
+  "#18181b",
+  "#000000",
+  "#fde047",
+  "#fbbf24",
+  "#f97316",
+  "#ef4444",
+  "#ec4899",
+  "#a855f7",
+  "#6366f1",
+  "#38bdf8",
+  "#22d3ee",
+  "#34d399",
+  "#a3e635",
+  "#facc15",
+];
+
+type ColourRole = "textColor" | "highlightColor";
+
+/** Roughly the panel's rendered height, used only to pick a direction for it. */
+const PANEL_HEIGHT = 160;
+
+/**
+ * The two caption colours, behind one popover. We draw our own panel instead of
+ * leaning on `<input type="color">`: Chrome positions the native popup itself,
+ * and near the right edge of a narrow window it slides off screen with nothing
+ * we can do to pull it back. This panel anchors to the inspector (`right-0`), so
+ * it always opens leftwards into the rail.
+ */
+function ColourPicker({
+  textColor,
+  highlightColor,
+  onChange,
+}: {
+  textColor: string;
+  highlightColor: string;
+  onChange: (part: Partial<CaptionStyle>) => void;
+}) {
+  const [openFor, setOpenFor] = useState<ColourRole | null>(null);
+  // Open upwards when the row sits near the bottom of the window, so the panel
+  // can't land past the fold (the inspector is a full-height rail on wide
+  // screens and a lower page section on narrow ones).
+  const [openUp, setOpenUp] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  const toggle = (role: ColourRole) => {
+    if (openFor === role) {
+      setOpenFor(null);
+      return;
+    }
+    const rect = rootRef.current?.getBoundingClientRect();
+    if (rect) setOpenUp(window.innerHeight - rect.bottom < PANEL_HEIGHT + 24);
+    setOpenFor(role);
+  };
+
+  useEffect(() => {
+    if (!openFor) return;
+    const closeOnOutside = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpenFor(null);
+    };
+    const closeOnEscape = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpenFor(null);
+    };
+    document.addEventListener("mousedown", closeOnOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("mousedown", closeOnOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [openFor]);
+
+  const value = openFor === "highlightColor" ? highlightColor : textColor;
+  const setValue = (next: string) => {
+    if (openFor) onChange({ [openFor]: next } as Partial<CaptionStyle>);
+  };
+
+  const button = (role: ColourRole, label: string, colour: string) => (
+    <button
+      type="button"
+      aria-label={label}
+      aria-haspopup="dialog"
+      aria-expanded={openFor === role}
+      onClick={() => toggle(role)}
+      className={`flex items-center justify-between gap-2 rounded-lg border px-2.5 py-2 text-left transition ${
+        openFor === role
+          ? "border-zinc-900 dark:border-zinc-100"
+          : "border-zinc-200 hover:border-zinc-400 dark:border-zinc-800 dark:hover:border-zinc-600"
+      }`}
+    >
       <span className="text-xs font-medium text-zinc-600 dark:text-zinc-300">{label}</span>
       <span
-        className="relative h-6 w-9 shrink-0 overflow-hidden rounded-md border border-zinc-300 dark:border-zinc-700"
-        style={{ background: value }}
-      >
-        <input
-          type="color"
-          aria-label={`${label} colour`}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
-        />
-      </span>
-    </label>
+        aria-hidden="true"
+        className="h-6 w-9 shrink-0 rounded-md border border-zinc-300 dark:border-zinc-700"
+        style={{ background: colour }}
+      />
+    </button>
+  );
+
+  return (
+    <div ref={rootRef} className="relative">
+      <div className="grid grid-cols-2 gap-2">
+        {button("textColor", "Text colour", textColor)}
+        {button("highlightColor", "Highlight colour", highlightColor)}
+      </div>
+
+      {openFor && (
+        <div
+          role="dialog"
+          aria-label={openFor === "textColor" ? "Text colour" : "Highlight colour"}
+          className={`absolute right-0 z-40 flex w-60 flex-col gap-3 rounded-xl border border-zinc-200 bg-white p-3 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 ${
+            openUp ? "bottom-full mb-1" : "top-full mt-1"
+          }`}
+        >
+          <div className="grid grid-cols-6 gap-1.5">
+            {QUICK_COLOURS.map((colour) => (
+              <button
+                key={colour}
+                type="button"
+                aria-label={colour}
+                title={colour}
+                onClick={() => setValue(colour)}
+                className={`h-6 w-full rounded-md border border-black/10 transition hover:scale-110 ${
+                  value.toLowerCase() === colour ? "ring-2 ring-zinc-900 dark:ring-zinc-100" : ""
+                }`}
+                style={{ background: colour }}
+              />
+            ))}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <label className="flex flex-1 items-center gap-1 rounded-lg border border-zinc-200 px-2 py-1.5 focus-within:border-zinc-400 dark:border-zinc-700 dark:focus-within:border-zinc-500">
+              <span className="text-xs text-zinc-400">#</span>
+              <input
+                // Remount when the value changes from a swatch or the native
+                // picker, so the field shows the new colour without an effect.
+                key={value}
+                type="text"
+                aria-label="Hex colour"
+                defaultValue={value.replace(/^#/, "")}
+                spellCheck={false}
+                maxLength={7}
+                onChange={(e) => {
+                  const hex = toHex(e.target.value);
+                  if (hex) setValue(hex);
+                }}
+                onBlur={(e) => {
+                  // Put the typed text back if it never became a valid colour.
+                  if (!toHex(e.target.value)) e.target.value = value.replace(/^#/, "");
+                }}
+                className="w-full bg-transparent text-xs text-zinc-900 outline-none dark:text-zinc-100"
+              />
+            </label>
+            <label className="flex shrink-0 items-center gap-1.5 rounded-lg border border-zinc-200 px-2 py-1.5 text-xs text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+              Custom
+              <input
+                type="color"
+                aria-label="Custom colour"
+                value={toHex(value) ?? "#000000"}
+                onChange={(e) => setValue(e.target.value)}
+                className="h-5 w-6 cursor-pointer rounded border-0 bg-transparent p-0"
+              />
+            </label>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
