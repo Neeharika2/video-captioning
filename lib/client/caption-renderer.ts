@@ -9,10 +9,20 @@
  */
 import type { Caption } from "../types";
 import { EMPHASIS_WEIGHT, layoutCaption } from "../caption-layout";
-import { CAPTION_MAX_WIDTH, blockTop, cssFont, speakerColor, withAlpha, type CaptionStyle } from "../caption-style";
+import {
+  CAPTION_MAX_WIDTH,
+  applyCase,
+  blockLeft,
+  blockTop,
+  cssFont,
+  speakerColor,
+  withAlpha,
+  type CaptionStyle,
+  type CaptionEmphasis,
+  type TextCase,
+} from "../caption-style";
 import {
   ENTER_SECONDS,
-  KEYWORD_SCALE,
   REST,
   activeToken,
   canSplitLetters,
@@ -26,7 +36,7 @@ import {
   letterStagger,
   loopBlockPose,
   motionPose,
-  pickKeywords,
+  punchlineIndices,
   shinePosition,
   splitGraphemes,
   tokenSpeakers,
@@ -103,6 +113,10 @@ type Token = {
   size: number;
   font: string;
   keyword: boolean;
+  /** Style this word is drawn with (the punchline's second face, or the base). */
+  variant: CaptionStyle;
+  /** Index into the caption's own word list, for timings. */
+  wordIndex: number;
   start: number;
   end: number;
 };
@@ -126,6 +140,57 @@ type Glyph = {
   /** Second colour painted over the left part of the word (karaoke, marker, fill). */
   over?: { color: string; from: number; to: number };
 };
+
+/** One word as it sits in the on-screen arrangement, before slots are measured. */
+type RowItem = { text: string; keyword: boolean; variant: CaptionStyle; index: number };
+
+/** Apply a text case to one word without touching the rest of the style. */
+function caseAs(textCase: TextCase, text: string): string {
+  return applyCase({ textCase }, text);
+}
+
+/** The style the punchline word(s) are drawn with — the lockup's second face. */
+function keywordVariant(style: CaptionStyle): CaptionStyle {
+  return { ...style, fontFamily: style.keywordFontFamily, weight: style.keywordWeight, textCase: style.keywordCase };
+}
+
+/** The caption's words, always current even after the text was edited. */
+function captionWords(caption: Caption): string[] {
+  const text = caption.text.trim();
+  if (!text) return [];
+  const fromWords = caption.words.map((w) => w.text).join(" ").trim();
+  return caption.words.length && fromWords === text ? caption.words.map((w) => w.text) : text.split(/\s+/).filter(Boolean);
+}
+
+/**
+ * Rows for a non-block layout: "stack" gives every word its own row, "lockup"
+ * puts the words before the punchline on one row, the punchline word(s) on the
+ * next, and anything after them on a third. Reading order is preserved whatever
+ * the punchline's position in the line, so a middle punchline never jumps to the
+ * bottom. Empty rows are dropped, so the usual trailing punchline still gives
+ * the familiar base / punchline pair.
+ */
+function punchRows(style: CaptionStyle, words: string[], punch: Set<number>, punchStyle: CaptionStyle): RowItem[][] {
+  if (!words.length) return [];
+  const item = (text: string, index: number): RowItem => {
+    const keyword = punch.has(index);
+    return { text: caseAs(keyword ? style.keywordCase : style.textCase, text), keyword, variant: keyword ? punchStyle : style, index };
+  };
+  if (style.layout === "stack") return words.map((text, index) => [item(text, index)]);
+  if (!punch.size) return [words.map((text, index) => item(text, index))];
+  const marked = words.map((_, index) => index).filter((index) => punch.has(index));
+  const first = marked[0];
+  const last = marked[marked.length - 1];
+  const rows: RowItem[][] = [];
+  const slice = (from: number, to: number) => words.slice(from, to).map((text, i) => item(text, from + i));
+  const before = slice(0, first);
+  const hero = slice(first, last + 1);
+  const after = slice(last + 1, words.length);
+  if (before.length) rows.push(before);
+  if (hero.length) rows.push(hero);
+  if (after.length) rows.push(after);
+  return rows;
+}
 
 /**
  * Draw `caption` onto a `width`×`height` frame at time `t` (seconds, on the
@@ -159,31 +224,53 @@ export function drawCaption(
 
   // Same line-breaking and fit-to-width logic as the hit box in the preview.
   const layout = layoutCaption(style, caption, width, height, measure);
-  const lineWords = layout.lines.map((line) => line.split(/\s+/).filter(Boolean));
-  const flat = lineWords.flat();
-  const keywords = style.keywords ? pickKeywords(flat) : new Set<number>();
+  const layoutWords = layout.lines.map((line) => line.split(/\s+/).filter(Boolean));
+  const flat = layoutWords.flat();
+  // The accent target is a preset decision: "spoken" marks the word being said,
+  // "keyword" marks the caption's punchline instead.
+  const emphasis = style.emphasisTarget === "spoken" ? style.emphasis : "none";
   const speakers = style.speakerColors ? tokenSpeakers(caption, flat.length) : null;
   // Weight shift: every word gets a slot as wide as its bold look, so nothing
   // shifts sideways when a word turns bold.
-  const slotStyle = style.emphasis === "weight" ? { ...style, weight: Math.max(style.weight, EMPHASIS_WEIGHT) } : style;
+  const slotStyle = emphasis === "weight" ? { ...style, weight: Math.max(style.weight, EMPHASIS_WEIGHT) } : style;
   const tiles = style.treatment === "tiles";
+  const punchStyle = keywordVariant(style);
 
-  /** Word slots on every line at font size `em`. */
+  const sourceWords = style.layout === "block" ? flat : captionWords(caption);
+  const punch =
+    style.emphasisTarget === "keyword" || style.layout !== "block"
+      ? punchlineIndices(sourceWords, caption.punchlineWordIndices, style.layout === "lockup")
+      : new Set<number>();
+
+  // On-screen rows: block wraps normally; lockup splits at the punchline word(s);
+  // stack gives every word its own row.
+  let flatIndex = 0;
+  const itemRows: RowItem[][] =
+    style.layout === "block"
+      ? layoutWords.map((texts) =>
+          texts.map((text) => {
+            const index = flatIndex++;
+            const keyword = punch.has(index);
+            return { text: keyword ? caseAs(style.keywordCase, text) : text, keyword, variant: keyword ? punchStyle : style, index };
+          }),
+        )
+      : punchRows(style, sourceWords, punch, punchStyle);
+
+  /** Word slots on every row at base font size `em`. */
   const arrange = (em: number) => {
     const gap = measure(" ", cssFont(style, em)) + (tiles ? em * 0.45 : 0);
-    let index = 0;
-    const rows = lineWords.map((words) => {
-      const slots = words.map((text) => {
-        const keyword = keywords.has(index++);
-        const size = keyword ? Math.round(em * KEYWORD_SCALE) : em;
-        return { text, size, keyword, w: measure(text, cssFont(slotStyle, size)) };
+    const rows = itemRows.map((items) => {
+      const slots = items.map((item) => {
+        const size = item.keyword ? Math.max(8, Math.round(em * style.keywordScale)) : em;
+        const measureStyle = item.keyword ? item.variant : slotStyle;
+        return { ...item, size, w: measure(item.text, cssFont(measureStyle, size)) };
       });
       const lineWidth = slots.reduce((sum, slot) => sum + slot.w, 0) + gap * Math.max(0, slots.length - 1);
-      return { slots, lineWidth, rtl: isRtl(words.join(" ")) };
+      return { slots, lineWidth, rtl: isRtl(items.map((item) => item.text).join(" ")) };
     });
     return { em, gap, rows, widest: rows.reduce((m, r) => Math.max(m, r.lineWidth), 0) };
   };
-  // Bigger keywords and spaced-out tiles can overrun the width: shrink to fit.
+  // Bigger punchlines and spaced-out tiles can overrun the width: shrink to fit.
   const maxWidth = width * CAPTION_MAX_WIDTH;
   let arranged = arrange(layout.fontSize);
   if (arranged.widest > maxWidth) {
@@ -192,22 +279,36 @@ export function drawCaption(
   const { em, gap, rows, widest } = arranged;
   const shrink = em / layout.fontSize;
 
-  const lineHeight = Math.round(em * 1.3);
+  // Each row is as tall as its tallest word, so a big punchline line never
+  // collides with the base line.
+  const rowHeights = rows.map((row) => Math.round(Math.max(...row.slots.map((slot) => slot.size)) * 1.3));
   const padX = Math.round(em * 0.5);
   const padY = Math.round(em * 0.3);
   const sub = layout.sub ? { size: Math.max(8, Math.round(layout.sub.fontSize * shrink)), lines: layout.sub.lines } : null;
   const subLineHeight = sub ? Math.round(sub.size * 1.3) : 0;
-  const mainHeight = lineHeight * rows.length;
+  const mainHeight = rowHeights.reduce((sum, h) => sum + h, 0);
   const blockHeight = mainHeight + subLineHeight * (sub?.lines.length ?? 0);
   const top = blockTop(style, height, blockHeight);
-  const cx = width / 2;
+  const blockLeftPx = blockLeft(style, width, widest);
+  // Each row is anchored to the block: left/right rows line up with the block
+  // edge, centred rows centre on it (which is the frame centre when centred).
+  const rowLeft = (lineWidth: number) =>
+    style.align === "left"
+      ? blockLeftPx
+      : style.align === "right"
+        ? blockLeftPx + widest - lineWidth
+        : blockLeftPx + (widest - lineWidth) / 2;
+  const cx = blockLeftPx + widest / 2;
   const cy = top + blockHeight / 2;
 
-  // Place every word on its line (right-to-left lines run from the right edge).
+  // Place every word on its row (right-to-left rows run from the right edge).
   const tokens: Token[] = [];
+  let rowTop = top;
   rows.forEach((row, i) => {
-    const left = (width - row.lineWidth) / 2;
-    const y = top + i * lineHeight + lineHeight / 2;
+    const rowHeight = rowHeights[i];
+    const left = rowLeft(row.lineWidth);
+    const y = rowTop + rowHeight / 2;
+    rowTop += rowHeight;
     let before = 0;
     for (const slot of row.slots) {
       const slotX = row.rtl ? left + row.lineWidth - before - slot.w : left + before;
@@ -224,23 +325,26 @@ export function drawCaption(
         size: slot.size,
         font: "",
         keyword: slot.keyword,
+        variant: slot.variant,
+        wordIndex: slot.index,
         start: 0,
         end: 0,
       });
     }
   });
-  const timings = tokenTimings(caption, flat);
-  tokens.forEach((tok, k) => {
-    tok.start = timings[k].start;
-    tok.end = timings[k].end;
+  const timings = tokenTimings(caption, sourceWords);
+  tokens.forEach((tok) => {
+    const timing = timings[tok.wordIndex] ?? timings[timings.length - 1];
+    tok.start = timing?.start ?? caption.start;
+    tok.end = timing?.end ?? caption.end;
   });
   const active = activeToken(timings, t);
   const age = t - caption.start;
 
   // Fonts now that the spoken word is known: weight shift bolds just that one.
   tokens.forEach((tok, k) => {
-    const bold = style.emphasis === "weight" && k === active;
-    tok.font = cssFont(bold ? slotStyle : style, tok.size);
+    const bold = emphasis === "weight" && k === active;
+    tok.font = cssFont(bold ? slotStyle : tok.variant, tok.size);
     tok.w = measure(tok.text, tok.font);
     tok.x = tok.slotX + (tok.slotW - tok.w) / 2;
   });
@@ -267,7 +371,7 @@ export function drawCaption(
     ctx.save();
     if (style.animateBy !== "caption" && !still) ctx.globalAlpha *= clamp01(age / 0.15);
     ctx.fillStyle = withAlpha(style.boxColor, style.boxOpacity);
-    roundedRect(ctx, (width - widest) / 2 - padX, top - padY, widest + padX * 2, blockHeight + padY * 2, em * 0.35);
+    roundedRect(ctx, rowLeft(widest) - padX, top - padY, widest + padX * 2, blockHeight + padY * 2, em * 0.35);
     ctx.fill();
     ctx.restore();
   }
@@ -314,30 +418,31 @@ export function drawCaption(
     }
     if (style.dimUpcoming && k > active) ctx.globalAlpha *= 0.38;
 
-    drawDecoration(ctx, style, tokens, k, active, t, still, em);
+    drawDecoration(ctx, style, emphasis, tokens, k, active, t, still, em);
 
-    // Base colour: the speaker's, or the accent for a keyword.
-    let color = speakers ? speakerColor(style, speakers[k]) : style.textColor;
+    // Base colour: the speaker's, the accent for a punchline word, or the base.
+    let color = speakers ? speakerColor(style, speakers[k]) : tok.variant.textColor;
     if (tok.keyword) color = style.highlightColor;
     let over: Glyph["over"];
     let hollow = false;
-    if (style.emphasis === "color" && k === active) color = style.highlightColor;
-    if (style.emphasis === "box" && k === active) color = onHighlight;
-    if ((style.emphasis === "sweep" || style.emphasis === "marker") && k <= active) {
-      const fill = style.emphasis === "sweep" ? style.highlightColor : onHighlight;
-      const p = k < active || still ? 1 : sweepProgress(style, tok, t);
+    if (emphasis === "color" && k === active) color = style.highlightColor;
+    if (emphasis === "box" && k === active) color = onHighlight;
+    if ((emphasis === "sweep" || emphasis === "marker") && k <= active) {
+      const fill = emphasis === "sweep" ? style.highlightColor : onHighlight;
+      const p = k < active || still ? 1 : sweepProgress(emphasis, tok, t);
       if (p >= 1) color = fill;
       else if (p > 0) over = sweepOver(tok, fill, p);
     }
-    if (style.emphasis === "fill" && k >= active) {
+    if (emphasis === "fill" && k >= active) {
       // Outlined until spoken; the spoken word floods solid from its start.
-      const p = k > active ? 0 : still ? 1 : sweepProgress(style, tok, t);
+      const p = k > active ? 0 : still ? 1 : sweepProgress(emphasis, tok, t);
       if (p < 1) {
         hollow = true;
         if (p > 0) over = sweepOver(tok, color, p);
       }
     }
-    const gradient = style.gradient && color === style.textColor && !over;
+    // A punchline word may fill with the text → accent gradient (the lockup look).
+    const gradient = (style.gradient && color === style.textColor && !over) || (tok.keyword && style.keywordGradient && !over);
     const blurEm = blockEnter.blur + wordEnter.blur;
     const blur = (b: number) => b * em * pxScale;
 
@@ -377,12 +482,12 @@ export function drawCaption(
     sub.lines.forEach((line, i) => {
       const w = measure(line, subFont);
       const y = top + mainHeight + i * subLineHeight + subLineHeight / 2;
-      glyphs.push(glyph(line, (width - w) / 2, y, { font: subFont, size: sub.size }, { color, blur: blockEnter.blur * em * pxScale }));
+      glyphs.push(glyph(line, rowLeft(w), y, { font: subFont, size: sub.size }, { color, blur: blockEnter.blur * em * pxScale }));
     });
     ctx.restore();
   }
 
-  paintGlyphs(ctx, glyphs, style, em, pxScale, age, still, { left: (width - widest) / 2, width: widest, top, height: blockHeight });
+  paintGlyphs(ctx, glyphs, style, em, pxScale, age, still, { left: blockLeftPx, width: widest, top, height: blockHeight });
   ctx.restore();
 }
 
@@ -394,10 +499,10 @@ function sweepOver(tok: Token, color: string, p: number): NonNullable<Glyph["ove
 }
 
 /** How far the karaoke fill or marker has crossed the word (0–1). */
-function sweepProgress(style: CaptionStyle, tok: Token, t: number): number {
+function sweepProgress(emphasis: CaptionEmphasis, tok: Token, t: number): number {
   const dur = tok.end - tok.start;
   // Karaoke follows the word's own length; the marker swipes in briskly.
-  if (style.emphasis === "sweep") return clamp01((t - tok.start) / Math.max(0.12, dur));
+  if (emphasis === "sweep") return clamp01((t - tok.start) / Math.max(0.12, dur));
   return easeOutCubic(clamp01((t - tok.start) / Math.min(0.5, Math.max(0.15, dur))));
 }
 
@@ -413,6 +518,7 @@ function wordMotionFor(style: CaptionStyle, tokens: Token[], k: number, active: 
 function drawDecoration(
   ctx: Ctx,
   style: CaptionStyle,
+  emphasis: CaptionEmphasis,
   tokens: Token[],
   k: number,
   active: number,
@@ -423,8 +529,8 @@ function drawDecoration(
   const tok = tokens[k];
   const color = style.highlightColor;
 
-  if (style.emphasis === "marker" && k <= active) {
-    const p = k < active || still ? 1 : sweepProgress(style, tok, t);
+  if (emphasis === "marker" && k <= active) {
+    const p = k < active || still ? 1 : sweepProgress(emphasis, tok, t);
     if (p <= 0) return;
     const w = (tok.w + em * 0.16) * p;
     const x = tok.rtl ? tok.x + tok.w + em * 0.08 - w : tok.x - em * 0.08;
@@ -439,7 +545,7 @@ function drawDecoration(
     return;
   }
 
-  if ((style.emphasis !== "box" && style.emphasis !== "underline") || k !== active) return;
+  if ((emphasis !== "box" && emphasis !== "underline") || k !== active) return;
 
   // Glide from the previous word when it sits on the same line; otherwise pop in.
   const prev = k > 0 && tokens[k - 1].line === tok.line ? tokens[k - 1] : null;
@@ -453,7 +559,7 @@ function drawDecoration(
   ctx.fillStyle = color;
   ctx.translate(x + w / 2, tok.y);
   if (grow !== 1) ctx.scale(grow, grow);
-  if (style.emphasis === "box") {
+  if (emphasis === "box") {
     const padX = em * 0.2;
     roundedRect(ctx, -w / 2 - padX, -em * 0.6, w + padX * 2, em * 1.12, em * 0.22);
   } else {

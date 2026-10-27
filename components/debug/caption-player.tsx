@@ -18,6 +18,7 @@ import {
   styleForCaption,
   type CaptionPlacement,
   type CaptionPosition,
+  type CaptionAlign,
   type CaptionStyle,
 } from "@/lib/caption-style";
 import { layoutCaption } from "@/lib/caption-layout";
@@ -95,6 +96,7 @@ export function CaptionPlayer({
   const dragRef = useRef<{
     id: string | null;
     position: CaptionPosition;
+    align: CaptionAlign;
     x0: number;
     y0: number;
     ox: number;
@@ -260,6 +262,7 @@ export function CaptionPlayer({
         stageW,
         stageH,
         d.position,
+        d.align,
       );
       change(d.id, { position: d.position, offsetX: round(next.x, 4), offsetY: round(next.y, 4) });
     };
@@ -368,6 +371,10 @@ export function CaptionPlayer({
   const margin = Math.round(stageH * 0.07);
   const alignItems =
     effStyle.position === "top" ? "flex-start" : effStyle.position === "middle" ? "center" : "flex-end";
+  // Mirror the canvas `blockLeft`: left/right looks hang off their edge instead
+  // of centring, so the grab box sits over the painted text.
+  const justifyContent = effStyle.align === "left" ? "flex-start" : effStyle.align === "right" ? "flex-end" : "center";
+  const blockAlign = effStyle.align === "left" ? "left" : effStyle.align === "right" ? "right" : "center";
   // The canvas paints the caption; this block only mirrors its size and spot so
   // it can be grabbed. Same font, size and line breaks, but invisible ink.
   const blockStyle: CSSProperties = {
@@ -377,7 +384,7 @@ export function CaptionPlayer({
     fontSize,
     fontWeight: style.weight,
     lineHeight: 1.3,
-    textAlign: "center",
+    textAlign: blockAlign,
     textTransform: style.textCase === "upper" ? "uppercase" : style.textCase === "lower" ? "lowercase" : undefined,
     color: "transparent",
     userSelect: "none",
@@ -406,6 +413,7 @@ export function CaptionPlayer({
     dragRef.current = {
       id: cue?.id ?? null,
       position: base?.position ?? style.position,
+      align: style.align,
       ox: base?.offsetX ?? style.offsetX,
       oy: base?.offsetY ?? style.offsetY,
       x0: e.clientX,
@@ -520,8 +528,8 @@ export function CaptionPlayer({
           />
           {(cue || showGhost) && (
             <div
-              className="pointer-events-none absolute inset-0 flex justify-center px-[6%]"
-              style={{ alignItems, paddingTop: margin, paddingBottom: margin }}
+              className="pointer-events-none absolute inset-0 flex px-[6%]"
+              style={{ alignItems, justifyContent, paddingTop: margin, paddingBottom: margin }}
               data-testid="overlay"
             >
               <div
@@ -537,7 +545,9 @@ export function CaptionPlayer({
                 data-outline={style.outline ? "true" : "false"}
                 data-text-case={style.textCase}
                 data-words-per-caption={style.wordsPerCaption}
-                data-keywords={style.keywords ? "true" : "false"}
+                data-emphasis-target={style.emphasisTarget}
+                data-layout={style.layout}
+                data-keyword-gradient={style.keywordGradient ? "true" : "false"}
                 data-gradient={style.gradient ? "true" : "false"}
                 data-bilingual={style.bilingual ? "true" : "false"}
                 data-speaker-colors={style.speakerColors ? "true" : "false"}
@@ -613,9 +623,12 @@ function clampOffsets(
   stageW: number,
   stageH: number,
   position: CaptionPosition,
+  align: CaptionAlign,
 ): { x: number; y: number } {
   const marginPx = Math.round(stageH * 0.07);
-  const baseLeft = (stageW - blockW) / 2;
+  const sideMargin = stageW * 0.06;
+  const baseLeft =
+    align === "left" ? sideMargin : align === "right" ? stageW - sideMargin - blockW : (stageW - blockW) / 2;
   const baseTop =
     position === "top" ? marginPx : position === "middle" ? (stageH - blockH) / 2 : stageH - marginPx - blockH;
   return {

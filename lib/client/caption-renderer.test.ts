@@ -230,9 +230,9 @@ describe("drawCaption: preset looks", () => {
     expect(shadowed.every((c) => c.shadow.blur === 0)).toBe(true);
   });
 
-  it("sets keywords bigger in the accent colour", () => {
+  it("sets punchline words bigger in the accent colour", () => {
     const c: Caption = { ...caption, text: "I made $5000", words: [] };
-    const { fills } = draw({ keywords: true, highlightColor: "#00ff00" }, 2, true, c);
+    const { fills } = draw({ emphasisTarget: "keyword", highlightColor: "#00ff00" }, 2, true, c);
     const size = (f: Call) => Number(/(\d+)px/.exec(f.font)?.[1]);
     expect(fills[2].fill).toBe("#00ff00");
     expect(size(fills[2])).toBeGreaterThan(size(fills[0]));
@@ -241,6 +241,74 @@ describe("drawCaption: preset looks", () => {
   it("fills text with a gradient", () => {
     const { fills } = draw({ gradient: true }, 2, true);
     expect(fills.every((f) => (f.fill as { gradient?: boolean }).gradient)).toBe(true);
+  });
+
+  it("breaks a lockup into a base line and a bigger punchline line in a second font", () => {
+    const c: Caption = { ...caption, text: "we made 5000", words: [] };
+    const { fills } = draw(
+      { layout: "lockup", emphasisTarget: "keyword", keywordFontFamily: "anton", keywordScale: 2 },
+      2,
+      true,
+      c,
+    );
+    const size = (f: Call) => Number(/(\d+)px/.exec(f.font)?.[1]);
+    const base = fills.filter((f) => f.text === "we" || f.text === "made");
+    const hero = fills.find((f) => f.text === "5000");
+    expect(base).toHaveLength(2);
+    expect(hero).toBeDefined();
+    // Base words share a line; the punchline sits on the line below, bigger.
+    expect(base[0].y).toBe(base[1].y);
+    expect(hero!.y!).toBeGreaterThan(base[0].y!);
+    expect(size(hero!)).toBeGreaterThan(size(base[0]));
+    expect(hero!.font).toContain("Anton");
+  });
+
+  it("keeps a middle punchline in reading order instead of forcing it to the bottom", () => {
+    const c: Caption = { ...caption, text: "we made 5000 today", words: [], punchlineWordIndices: [2] };
+    const { fills } = draw({ layout: "lockup", emphasisTarget: "keyword" }, 2, true, c);
+    const y = (text: string) => fills.find((f) => f.text === text)!.y!;
+    // The words before the punchline share a row; the punchline and the word
+    // that follows keep their order, one row each.
+    expect(y("we")).toBe(y("made"));
+    expect(y("5000")).toBeGreaterThan(y("we"));
+    expect(y("today")).toBeGreaterThan(y("5000"));
+  });
+
+  it("stacks one word per row in a stack layout", () => {
+    const c: Caption = { ...caption, text: "we made 5000", words: [] };
+    const { fills } = draw({ layout: "stack", emphasisTarget: "keyword" }, 2, true, c);
+    expect(new Set(fills.map((f) => f.y)).size).toBe(3);
+  });
+
+  it("anchors the block to the left, centre or right edge", () => {
+    const c: Caption = { ...caption, text: "pop", words: [] };
+    const x = (align: CaptionStyle["align"]) => draw({ align }, 2, true, c).fills[0].x!;
+    expect(x("left")).toBeLessThan(x("center"));
+    expect(x("center")).toBeLessThan(x("right"));
+  });
+
+  it("fills the punchline with the text → accent gradient when asked", () => {
+    const c: Caption = { ...caption, text: "we made 5000", words: [] };
+    const { fills } = draw(
+      { layout: "lockup", emphasisTarget: "keyword", keywordGradient: true, textColor: "#ff8a00", highlightColor: "#ffd000" },
+      2,
+      true,
+      c,
+    );
+    expect((fills.find((f) => f.text === "5000")!.fill as { gradient?: boolean }).gradient).toBe(true);
+  });
+
+  it("ignores spoken-word emphasis when the accent targets the punchline", () => {
+    const c: Caption = { ...caption, text: "we made 5000", words: [] };
+    const { fills } = draw(
+      { layout: "lockup", emphasisTarget: "keyword", emphasis: "color", highlightColor: "#00ff00" },
+      2,
+      true,
+      c,
+    );
+    // "made" is the word being spoken, but the preset marks the punchline only.
+    expect(fills.find((f) => f.text === "made")?.fill).not.toBe("#00ff00");
+    expect(fills.find((f) => f.text === "5000")?.fill).toBe("#00ff00");
   });
 
   it("draws the other script under the caption", () => {

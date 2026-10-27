@@ -250,7 +250,8 @@ test("captions animate in when they appear", async ({ page }) => {
   await runPipeline(page, "speech.mp4");
   await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
 
-  await page.getByRole("button", { name: "Pop", exact: true }).click();
+  // Entrance is baked into the preset: Big Word pops each letter in.
+  await page.getByRole("button", { name: "Big Word" }).click();
   await page.getByTestId("captions").getByRole("button").first().click();
   await expect(page.getByTestId("overlay").locator("[data-caption-block]")).toHaveAttribute("data-animation", "pop");
 });
@@ -264,8 +265,9 @@ test("style presets apply their look to the preview", async ({ page }) => {
   const block = page.getByTestId("overlay").locator("[data-caption-block]");
   await expect(block).toBeVisible();
 
-  // Bold Viral uppercases the text and strokes the glyphs (outline axis).
-  await page.getByRole("button", { name: "Bold Viral" }).click();
+  // Spotlight uppercases the text, strokes the glyphs (outline axis) and
+  // animates word by word.
+  await page.getByRole("button", { name: "Spotlight" }).click();
   await expect(block).toHaveCSS("text-transform", "uppercase");
   await expect(block).toHaveAttribute("data-outline", "true");
   await expect(block).toHaveAttribute("data-animate-by", "word");
@@ -295,12 +297,12 @@ test("words on screen regroups the captions", async ({ page }) => {
   await expect(timeline.getByRole("button", { name: /Hello/ })).toHaveCount(1);
   await expect(timeline.getByRole("button", { name: /everyone/ })).toHaveCount(1);
 
-  // Back to four words: one cue again.
-  await page.getByRole("group", { name: "Words on screen" }).getByRole("button", { name: "4" }).click();
+  // A four-word preset regroups the captions back into one cue.
+  await page.getByRole("button", { name: "Classic Reels" }).click();
   await expect(timeline.getByRole("button", { name: /Hello everyone/ })).toHaveCount(1);
 });
 
-test("effects can be mixed and the caption is painted on the canvas", async ({ page }) => {
+test("presets drive the effects and the caption is painted on the canvas", async ({ page }) => {
   await mockApi(page);
   await runPipeline(page, "speech.mp4");
   await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
@@ -309,12 +311,11 @@ test("effects can be mixed and the caption is painted on the canvas", async ({ p
   const block = page.getByTestId("overlay").locator("[data-caption-block]");
   await expect(block).toBeVisible();
 
-  await page.getByRole("group", { name: "Spoken word" }).getByRole("button", { name: "Box" }).click();
-  await page.getByRole("group", { name: "Loop" }).getByRole("button", { name: "Wave" }).click();
-  await page.getByRole("group", { name: "Animate by" }).getByRole("button", { name: "Letter" }).click();
+  // Glide Box bundles a gliding box, a pop-in and a per-word grow.
+  await page.getByRole("button", { name: "Glide Box" }).click();
   await expect(block).toHaveAttribute("data-emphasis", "box");
-  await expect(block).toHaveAttribute("data-loop", "wave");
-  await expect(block).toHaveAttribute("data-animate-by", "letter");
+  await expect(block).toHaveAttribute("data-animation", "pop");
+  await expect(block).toHaveAttribute("data-word-motion", "grow");
 
   // The visible caption comes from the canvas, not the (transparent) text.
   await expect(block).toHaveCSS("color", "rgba(0, 0, 0, 0)");
@@ -337,13 +338,34 @@ test("the font picker previews each face in its own style", async ({ page }) => 
   await expect(block).toBeVisible();
 
   // The list renders each option in its own face before it is chosen.
-  await page.getByRole("button", { name: "Font" }).click();
+  await page.getByRole("button", { name: "Font", exact: true }).click();
   const bungee = page.getByRole("option", { name: /Bungee/ });
   await expect(bungee.locator("span").first()).toHaveCSS("font-family", /Bungee/);
 
   // Choosing it switches the live preview over as well.
   await bungee.click();
   await expect(block).toHaveCSS("font-family", /Bungee/);
+});
+
+test("a punchline preset exposes its own font control", async ({ page }) => {
+  await mockApi(page);
+  await runPipeline(page, "speech.mp4");
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+
+  // A punchline preset sets a second face for the punchline word, so a second
+  // font control appears for it.
+  await page.getByRole("button", { name: "Neon Sign" }).click();
+  const punchFont = page.getByRole("button", { name: "Punchline font", exact: true });
+  await expect(punchFont).toBeVisible();
+  await expect(punchFont).toContainText("Monoton");
+
+  await punchFont.click();
+  await page.getByRole("option", { name: /Bungee/ }).click();
+  await expect(punchFont).toContainText("Bungee");
+
+  // The control leaves with the punchline look.
+  await page.getByRole("button", { name: "Classic Reels" }).click();
+  await expect(page.getByRole("button", { name: "Punchline font", exact: true })).toHaveCount(0);
 });
 
 test("a caption can be resized from a corner and synced to all", async ({ page }) => {
@@ -459,6 +481,25 @@ test("server errors are shown with their code", async ({ page }) => {
   await runPipeline(page, "speech.mp4");
   await expect(page.getByTestId("status")).toContainText("Gemini daily limit reached", { timeout: 60_000 });
   await expect(page.getByTestId("status")).toContainText("quota_exceeded");
+});
+
+test("a finished project is saved in the browser and can be reopened after a reload", async ({ page }) => {
+  await mockApi(page);
+  await runPipeline(page, "speech.mp4");
+  await expect(page.getByTestId("status")).toHaveText("Done", { timeout: 60_000 });
+  // Autosave writes the project (video included) shortly after the pipeline ends.
+  await expect(page.getByTestId("save-state")).toHaveText("Saved", { timeout: 30_000 });
+
+  // Reload: the workspace resets to the Projects home, with the video listed.
+  await page.reload();
+  const card = page.getByTestId("project-card").first();
+  await expect(card).toBeVisible({ timeout: 30_000 });
+  await expect(card).toContainText("speech.mp4");
+
+  // Reopening restores the transcript and the captions, with no re-transcription.
+  await card.getByRole("button", { name: "speech.mp4", exact: true }).click();
+  await expect(page.getByTestId("captions")).toContainText("Hello everyone.", { timeout: 30_000 });
+  await expect(page.getByTestId("save-state")).toHaveText("Saved");
 });
 
 // Real end-to-end run against Gemini. Costs a fraction of a cent. Opt in with

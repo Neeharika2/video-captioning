@@ -23,8 +23,8 @@ import {
 import { PRESETS, PRESET_CATEGORIES } from "./caption-presets";
 
 describe("caption styles", () => {
-  it("ships twenty-two distinct, well-formed presets", () => {
-    expect(PRESETS).toHaveLength(22);
+  it("ships twenty-three distinct, well-formed presets", () => {
+    expect(PRESETS).toHaveLength(23);
     const ids = new Set(PRESETS.map((p) => p.id));
     expect(ids.size).toBe(PRESETS.length);
     for (const p of PRESETS) {
@@ -39,8 +39,33 @@ describe("caption styles", () => {
     }
   });
 
-  it("uses every shipped font in at least one preset", () => {
-    expect(new Set(PRESETS.map((p) => p.style.fontFamily))).toEqual(new Set(FONT_FAMILIES));
+  it("uses only shipped fonts in its presets", () => {
+    const shipped = new Set<string>(FONT_FAMILIES);
+    for (const p of PRESETS) {
+      expect(shipped.has(p.style.fontFamily), p.id).toBe(true);
+      expect(shipped.has(p.style.keywordFontFamily), p.id).toBe(true);
+    }
+  });
+
+  it("balances punchline, spoken and block looks", () => {
+    const of = (category: string) => PRESETS.filter((p) => p.category === category).length;
+    // The reference's punchline lockups are where the set should lean.
+    expect(of("punchline")).toBeGreaterThanOrEqual(7);
+    // The spoken presets are well liked and deliberately capped.
+    expect(of("spoken")).toBeGreaterThanOrEqual(5);
+    expect(of("spoken")).toBeLessThanOrEqual(7);
+    expect(of("block")).toBe(5);
+  });
+
+  it("gives every preset its own signature", () => {
+    const signature = (s: (typeof PRESETS)[number]["style"]) =>
+      [s.fontFamily, s.keywordFontFamily, s.keywordWeight, s.textCase, s.treatment, s.emphasis, s.emphasisTarget, s.layout, s.wordsPerCaption].join("|");
+    const seen = new Map<string, string>();
+    for (const p of PRESETS) {
+      const key = signature(p.style);
+      expect(seen.has(key), `${p.id} is a near-copy of ${seen.get(key)}`).toBe(false);
+      seen.set(key, p.id);
+    }
   });
 
   it("fills every gallery section", () => {
@@ -56,13 +81,17 @@ describe("caption styles", () => {
     expect(styles.some((s) => s.wordsPerCaption === 1)).toBe(true);
     expect(styles.some((s) => s.emphasis === "weight")).toBe(true);
     expect(styles.some((s) => s.emphasis === "fill")).toBe(true);
-    expect(styles.some((s) => s.treatment === "comic")).toBe(true);
     expect(styles.some((s) => s.treatment === "tiles")).toBe(true);
-    expect(styles.some((s) => s.keywords)).toBe(true);
+    expect(styles.some((s) => s.emphasisTarget === "keyword")).toBe(true);
+    expect(styles.some((s) => s.layout === "lockup")).toBe(true);
+    expect(styles.some((s) => s.layout === "stack")).toBe(true);
+    expect(styles.some((s) => s.keywordGradient)).toBe(true);
     expect(styles.some((s) => s.gradient)).toBe(true);
     expect(styles.some((s) => s.bilingual)).toBe(true);
     expect(styles.some((s) => s.speakerColors)).toBe(true);
     expect(styles.some((s) => s.outline)).toBe(true);
+    expect(styles.some((s) => s.align === "left")).toBe(true);
+    expect(styles.some((s) => s.align === "right")).toBe(true);
     expect(styles.some((s) => s.fontFamily === "righteous")).toBe(true);
     expect(styles.some((s) => s.fontFamily === "dmSerifDisplay")).toBe(true);
   });
@@ -74,8 +103,12 @@ describe("caption styles", () => {
     expect(withAlpha("#ffffff", 2)).toBe("rgba(255, 255, 255, 1)");
   });
 
-  it("uses the first preset as the default", () => {
-    expect(sameStyle(DEFAULT_STYLE, PRESETS[0].style)).toBe(true);
+  it("uses the Classic Reels preset as the default", () => {
+    const classic = PRESETS.find((p) => p.id === "classic-reels");
+    expect(classic).toBeDefined();
+    expect(sameStyle(DEFAULT_STYLE, classic!.style)).toBe(true);
+    expect(classic!.style.emphasisTarget).toBe("spoken");
+    expect(classic!.style.layout).toBe("block");
   });
 
   it("scales the font from the frame's short side", () => {
@@ -102,22 +135,22 @@ describe("caption styles", () => {
       expect(stack).toContain("Noto Sans Telugu");
       expect(stack).toContain("Noto Sans Devanagari");
       expect(stack).toContain("Noto Sans Arabic");
-      expect(stack).toMatch(/(sans-serif|serif|monospace)$/);
+      expect(stack).toMatch(/(sans-serif|serif|monospace|cursive)$/);
     }
   });
 
   it("offers the self-hosted faces, each ending in a generic family", () => {
     const stacks = Object.values(FONT_STACKS);
     expect(stacks.length).toBe(FONT_FAMILIES.length);
-    expect(FONT_FAMILIES.length).toBe(16);
+    expect(FONT_FAMILIES.length).toBe(40);
     for (const stack of stacks) {
-      expect(stack).toMatch(/(sans-serif|serif|monospace)$/);
+      expect(stack).toMatch(/(sans-serif|serif|monospace|cursive)$/);
     }
   });
 
-  it("keeps three clean, regular faces for everyday captions", () => {
+  it("keeps a set of clean, regular faces for everyday captions", () => {
     const clean = FONT_GROUPS.find((g) => g.label === "Clean & regular");
-    expect(clean?.fonts).toEqual(["inter", "poppins", "montserrat"]);
+    expect(clean?.fonts).toEqual(["inter", "poppins", "montserrat", "oswald"]);
   });
 
   it("lists every font exactly once in the picker groups, with a label", () => {
@@ -171,6 +204,16 @@ describe("caption effects in styles", () => {
     expect(style.outline).toBe(true);
     expect(style.animateBy).toBe(DEFAULT_STYLE.animateBy);
     expect(style.loop).toBe(DEFAULT_STYLE.loop);
+  });
+
+  it("upgrades the old `keywords` flag to an emphasis target", () => {
+    const { emphasisTarget: _t, ...rest } = DEFAULT_STYLE;
+    void _t;
+    expect(normalizeStyle({ ...rest, keywords: true }).emphasisTarget).toBe("keyword");
+    expect(normalizeStyle({ ...rest, keywords: false }).emphasisTarget).toBe("spoken");
+    expect(normalizeStyle({ ...DEFAULT_STYLE, emphasisTarget: "keyword" }).emphasisTarget).toBe("keyword");
+    expect(normalizeStyle({ ...DEFAULT_STYLE, layout: "lockup" }).layout).toBe("lockup");
+    expect(normalizeStyle({ ...DEFAULT_STYLE, layout: "nope" }).layout).toBe(DEFAULT_STYLE.layout);
   });
 
   it("upgrades the old uppercase flag and keeps words per caption in range", () => {

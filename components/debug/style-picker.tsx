@@ -2,16 +2,8 @@
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
-  ANIMATE_BY_LABELS,
-  ANIMATION_LABELS,
-  EMPHASIS_LABELS,
   FONT_GROUPS,
   FONT_LABELS,
-  LOOP_LABELS,
-  TEXT_CASE_LABELS,
-  TREATMENT_LABELS,
-  WORDS_PER_CAPTION,
-  WORD_MOTION_LABELS,
   fontStack,
   sameStyle,
   type CaptionStyle,
@@ -32,54 +24,34 @@ type Props = {
   onResetPlacements?: () => void;
 };
 
-/** `{ value, label }` options from a label map, in its declared order. */
-function optionsOf<T extends string>(labels: Record<T, string>): { value: T; label: string }[] {
-  return (Object.keys(labels) as T[]).map((value) => ({ value, label: labels[value] }));
-}
-
-const ANIMATIONS = optionsOf(ANIMATION_LABELS);
-const ANIMATE_BY = optionsOf(ANIMATE_BY_LABELS);
-const EMPHASES = optionsOf(EMPHASIS_LABELS);
-const WORD_MOTIONS = optionsOf(WORD_MOTION_LABELS);
-const LOOPS = optionsOf(LOOP_LABELS);
-const TREATMENTS = optionsOf(TREATMENT_LABELS);
-const CASES = optionsOf(TEXT_CASE_LABELS);
-const WORD_COUNTS = WORDS_PER_CAPTION.map((n) => ({ value: String(n), label: String(n) }));
-
 /**
- * Style inspector. A one-click preset gallery on top (each card plays its
- * effect on hover), then the look (font, colours, outline) and the effects:
- * entrance, what marks the spoken word, how it moves, and an idle loop. Size
- * and position are set by dragging the caption itself. Style is independent of
- * the transcript, so changes show live in the preview and in the burned-in
- * export, which are drawn by the same renderer.
+ * Preset-first style inspector: a live preview, a font per role, two colours and
+ * an outline toggle. Every other axis is baked into the presets.
  */
 export function StylePicker({ style, onChange, hasPlacements = false, onResetPlacements }: Props) {
   const active = PRESETS.find((p) => sameStyle(p.style, style));
   const patch = (part: Partial<CaptionStyle>) => onChange({ ...style, ...part });
+  // True when the current style paints anything in the highlight colour;
+  // otherwise the Highlight swatch looks broken, so we say so.
   const highlightUsed =
     (style.emphasis !== "none" && style.emphasis !== "weight" && style.emphasis !== "fill") ||
     style.treatment === "glow" ||
-    style.keywords ||
+    style.emphasisTarget === "keyword" ||
+    style.keywordGradient ||
     style.gradient ||
     style.speakerColors;
-  const boxUsed = style.treatment === "box" || style.treatment === "tiles";
+  // True when some word is set in the punchline face, so the second font
+  // control is worth showing.
+  const punchlineStyled = style.emphasisTarget === "keyword" || style.layout !== "block";
 
   return (
     <div className="flex flex-col gap-6 p-4 text-sm">
-      <section className="flex flex-col gap-3">
-        <SectionLabel>Presets</SectionLabel>
-        {PRESET_CATEGORIES.map((category) => (
-          <div key={category.id} role="group" aria-label={category.label} className="flex flex-col gap-1.5">
-            <span className="text-[11px] font-medium text-zinc-500 dark:text-zinc-400">{category.label}</span>
-            <div className="grid grid-cols-2 gap-2">
-              {PRESETS.filter((p) => p.category === category.id).map((p) => (
-                <PresetChip key={p.id} preset={p} selected={active?.id === p.id} onSelect={() => onChange({ ...p.style })} />
-              ))}
-            </div>
-          </div>
-        ))}
-      </section>
+      {/* Live preview of the current style, drawn by the same renderer as the
+          export. It stays pinned while the panel scrolls, so font, colour and
+          outline tweaks are always visible next to the controls. */}
+      <div className="sticky top-0 z-10 -mx-4 -mt-4 border-b border-zinc-200 bg-white px-4 pt-4 pb-3 dark:border-zinc-800 dark:bg-zinc-950">
+        <FeaturedPreview style={style} />
+      </div>
 
       <section className="flex flex-col gap-4">
         <SectionLabel>Look</SectionLabel>
@@ -87,6 +59,19 @@ export function StylePicker({ style, onChange, hasPlacements = false, onResetPla
         <Field label="Font">
           <FontPicker value={style.fontFamily} onChange={(fontFamily) => patch({ fontFamily })} />
         </Field>
+
+        {punchlineStyled && (
+          <Field label="Punchline font">
+            <FontPicker
+              label="Punchline font"
+              value={style.keywordFontFamily}
+              onChange={(keywordFontFamily) => patch({ keywordFontFamily })}
+            />
+            <p className="text-xs text-zinc-400 dark:text-zinc-500">
+              The face used for the punchline word, in its own colour.
+            </p>
+          </Field>
+        )}
 
         <div className="grid grid-cols-2 gap-2">
           <Swatch label="Text" value={style.textColor} onChange={(textColor) => patch({ textColor })} />
@@ -98,58 +83,15 @@ export function StylePicker({ style, onChange, hasPlacements = false, onResetPla
         </div>
         {!highlightUsed && (
           <p className="-mt-2 text-xs text-zinc-400 dark:text-zinc-500">
-            Highlight colours the spoken word — pick a style under Spoken word.
+            This preset doesn&rsquo;t use the highlight colour — try Karaoke, Word Tiles or a punchline preset.
           </p>
         )}
-
-        <Field label="Background">
-          <Choices label="Background" value={style.treatment} options={TREATMENTS} onChange={(treatment) => patch({ treatment })} />
-        </Field>
-        {boxUsed && <Swatch label="Box" value={style.boxColor} onChange={(boxColor) => patch({ boxColor })} />}
-
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Case">
-            <Segmented label="Case" value={style.textCase} options={CASES} onChange={(textCase) => patch({ textCase })} />
-          </Field>
-          <Field label="Words on screen">
-            <Segmented
-              label="Words on screen"
-              value={String(style.wordsPerCaption)}
-              options={WORD_COUNTS}
-              onChange={(n) => patch({ wordsPerCaption: Number(n) })}
-            />
-          </Field>
-        </div>
 
         <Toggle
           label="Outline"
           hint="Add a dark stroke around the letters."
           checked={style.outline}
           onChange={(outline) => patch({ outline })}
-        />
-        <Toggle
-          label="Gradient"
-          hint="Fade the text colour into the highlight colour, top to bottom."
-          checked={style.gradient}
-          onChange={(gradient) => patch({ gradient })}
-        />
-        <Toggle
-          label="Pop key words"
-          hint="Numbers and the most important word in each caption get bigger, in the highlight colour."
-          checked={style.keywords}
-          onChange={(keywords) => patch({ keywords })}
-        />
-        <Toggle
-          label="Bilingual line"
-          hint="Show the other script (original ↔ English letters) smaller underneath."
-          checked={style.bilingual}
-          onChange={(bilingual) => patch({ bilingual })}
-        />
-        <Toggle
-          label="Speaker colours"
-          hint="A colour per speaker: text colour, then highlight, then more. Needs Detect speakers before transcribing."
-          checked={style.speakerColors}
-          onChange={(speakerColors) => patch({ speakerColors })}
         />
 
         <div className="flex flex-col gap-1.5">
@@ -171,76 +113,38 @@ export function StylePicker({ style, onChange, hasPlacements = false, onResetPla
         </div>
       </section>
 
-      <section className="flex flex-col gap-4">
-        <SectionLabel>Effects</SectionLabel>
-
-        <Field label="Entrance">
-          <Choices label="Entrance" value={style.animation} options={ANIMATIONS} onChange={(animation) => patch({ animation })} />
-          <Segmented label="Animate by" value={style.animateBy} options={ANIMATE_BY} onChange={(animateBy) => patch({ animateBy })} />
-          <p className="text-xs text-zinc-500">
-            {style.animateBy === "caption"
-              ? "The whole caption animates in when it starts."
-              : `Each ${style.animateBy} appears as it's spoken.`}
-          </p>
-        </Field>
-
-        <Field label="Spoken word">
-          <Choices label="Spoken word" value={style.emphasis} options={EMPHASES} onChange={(emphasis) => patch({ emphasis })} />
-          <p className="text-xs text-zinc-500">{EMPHASIS_HINTS[style.emphasis]}</p>
-        </Field>
-
-        <Field label="Word motion">
-          <Choices
-            label="Word motion"
-            value={style.wordMotion}
-            options={WORD_MOTIONS}
-            onChange={(wordMotion) => patch({ wordMotion })}
-          />
-        </Field>
-
-        <Field label="Loop">
-          <Choices label="Loop" value={style.loop} options={LOOPS} onChange={(loop) => patch({ loop })} />
-          <p className="text-xs text-zinc-500">{LOOP_HINTS[style.loop]}</p>
-        </Field>
-
-        <Toggle
-          label="Dim upcoming words"
-          hint="Words fade up to full as they're spoken."
-          checked={style.dimUpcoming}
-          onChange={(dimUpcoming) => patch({ dimUpcoming })}
-        />
-
-        <p className="text-xs text-zinc-400 dark:text-zinc-500">Effects play while the video plays; pause to see the resting look.</p>
+      <section className="flex flex-col gap-3">
+        <SectionLabel>Presets</SectionLabel>
+        {PRESET_CATEGORIES.map((category) => (
+          <div key={category.id} role="group" aria-label={category.label} className="flex flex-col gap-1.5">
+            <span className="text-[11px] font-medium text-zinc-500 dark:text-zinc-400">{category.label}</span>
+            <div className="grid grid-cols-2 gap-2">
+              {PRESETS.filter((p) => p.category === category.id).map((p) => (
+                <PresetChip key={p.id} preset={p} selected={active?.id === p.id} onSelect={() => onChange({ ...p.style })} />
+              ))}
+            </div>
+          </div>
+        ))}
       </section>
     </div>
   );
 }
-
-const EMPHASIS_HINTS: Record<CaptionStyle["emphasis"], string> = {
-  none: "No highlight on the spoken word.",
-  color: "The spoken word switches to the highlight colour.",
-  sweep: "Colour fills each word left to right as it's spoken.",
-  box: "A box glides from word to word; its text stays readable automatically.",
-  marker: "A highlighter stroke grows under each word and stays.",
-  underline: "An underline glides along under the spoken word.",
-  weight: "The spoken word turns bold; the rest stay light.",
-  fill: "Words start as outlines and fill solid as they're spoken.",
-};
-
-const LOOP_HINTS: Record<CaptionStyle["loop"], string> = {
-  none: "No motion once the caption has landed.",
-  float: "The caption gently bobs while it's on screen.",
-  wave: "Letters ripple in a wave (Indian scripts wave word by word).",
-  shine: "A band of light sweeps across the text every few seconds.",
-  glitch: "Glitches as it lands, then in short random bursts.",
-};
 
 /**
  * Font chooser that renders each option in its own face. A native `<select>`
  * can't: the OS draws the option list and ignores `font-family`, which makes
  * the choice meaningless for a type-driven editor.
  */
-function FontPicker({ value, onChange }: { value: FontFamily; onChange: (family: FontFamily) => void }) {
+function FontPicker({
+  value,
+  onChange,
+  label = "Font",
+}: {
+  value: FontFamily;
+  onChange: (family: FontFamily) => void;
+  /** Accessible name, so the base and punchline pickers stay distinct. */
+  label?: string;
+}) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -266,7 +170,7 @@ function FontPicker({ value, onChange }: { value: FontFamily; onChange: (family:
         type="button"
         aria-haspopup="listbox"
         aria-expanded={open}
-        aria-label="Font"
+        aria-label={label}
         onClick={() => setOpen((o) => !o)}
         className="flex w-full items-center justify-between gap-2 rounded-lg border border-zinc-200 bg-white px-3 py-2 text-left text-zinc-900 transition hover:border-zinc-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:border-zinc-600"
       >
@@ -281,7 +185,7 @@ function FontPicker({ value, onChange }: { value: FontFamily; onChange: (family:
       {open && (
         <div
           role="listbox"
-          aria-label="Font"
+          aria-label={label}
           className="absolute z-30 mt-1 max-h-80 w-full overflow-y-auto rounded-xl border border-zinc-200 bg-white p-1 shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
         >
           {FONT_GROUPS.map((group) => (
@@ -395,16 +299,13 @@ function Toggle({
 /** A short spoken line the preset cards act out. */
 const DEMO: Caption = {
   id: "demo",
-  text: "Make it pop with 3 tricks",
+  text: "Made for creators",
   start: 0,
-  end: 2.5,
+  end: 2.4,
   words: [
-    { text: "Make", start: 0.15, end: 0.5, alt: "మేక్", speaker: "0" },
-    { text: "it", start: 0.5, end: 0.75, alt: "ఇట్", speaker: "0" },
-    { text: "pop", start: 0.75, end: 1.2, alt: "పాప్", speaker: "1" },
-    { text: "with", start: 1.2, end: 1.45, alt: "విత్", speaker: "1" },
-    { text: "3", start: 1.45, end: 1.7, alt: "3", speaker: "0" },
-    { text: "tricks", start: 1.7, end: 2.3, alt: "ట్రిక్స్", speaker: "0" },
+    { text: "Made", start: 0.2, end: 1, alt: "తయారు", speaker: "0" },
+    { text: "for", start: 1, end: 1.6, alt: "కోసం", speaker: "1" },
+    { text: "creators", start: 1.6, end: 2.3, alt: "క్రియేటర్లు", speaker: "0" },
   ],
 };
 
@@ -419,33 +320,39 @@ function demoCaptions(n: number): Caption[] {
   }
   return out;
 }
-/** One play-through of the demo, including a short blank beat before it repeats. */
-const DEMO_LOOP = 2.9;
+/** The demo plays from the first word's onset to the caption's end, on a loop. */
+const DEMO_FROM = DEMO.words[0].start;
 /**
- * Resting frame: inside the "3 tricks" cue, so a keyword AND the spoken word
- * both show at once — otherwise every card would read as a still of the same
- * white line.
+ * Resting frame: "for" is being spoken while "creators" is the punchline, so a
+ * spoken preset and a punchline preset show visibly different frames.
  */
-const DEMO_REST = 1.8;
+const DEMO_REST = 1.45;
 
 /**
  * Live miniature of a preset, drawn by the same renderer as the preview and
  * export. Plays continuously while the card is on screen (or hovered), so the
  * gallery shows each preset's motion rather than a row of still frames; off
  * screen it rests on `DEMO_REST`. Every preview shares one animation loop.
+ * `textPx` sets the base text height, so the featured card can render larger
+ * than the little grid cards while showing the same look.
  */
-function PresetPreview({ style, playing }: { style: CaptionStyle; playing: boolean }) {
+function PresetPreview({ style, playing, textPx = 13 }: { style: CaptionStyle; playing: boolean; textPx?: number }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const [visible, setVisible] = useState(false);
   const [fontTick, setFontTick] = useState(0);
 
   useEffect(() => {
     let live = true;
-    void ensureCaptionFont(style.fontFamily, style.weight).then(() => live && setFontTick((n) => n + 1));
+    // The punchline line uses a second face, so make sure it's loaded too.
+    const faces: [FontFamily, number][] = [[style.fontFamily, style.weight]];
+    if (style.emphasisTarget === "keyword") faces.push([style.keywordFontFamily, style.keywordWeight]);
+    void Promise.all(faces.map(([family, weight]) => ensureCaptionFont(family, weight))).then(
+      () => live && setFontTick((n) => n + 1),
+    );
     return () => {
       live = false;
     };
-  }, [style.fontFamily, style.weight]);
+  }, [style.fontFamily, style.weight, style.emphasisTarget, style.keywordFontFamily, style.keywordWeight]);
 
   // Animate only what's on screen, so a long gallery never runs dozens of
   // off-screen canvases.
@@ -483,7 +390,7 @@ function PresetPreview({ style, playing }: { style: CaptionStyle; playing: boole
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       if (t >= DEMO.end) return;
       // Centre it and size the text for the card rather than for a video frame.
-      const mini: CaptionStyle = { ...style, position: "middle", offsetX: 0, offsetY: 0, scale: 15 / Math.min(w, h) };
+      const mini: CaptionStyle = { ...style, position: "middle", offsetX: 0, offsetY: 0, scale: textPx / Math.min(w, h) };
       const cue = demoCaptions(style.wordsPerCaption).find((c) => t >= c.start && t < c.end);
       if (cue) drawCaption(ctx, cue, w, h, mini, t, { still });
     };
@@ -492,8 +399,13 @@ function PresetPreview({ style, playing }: { style: CaptionStyle; playing: boole
       return;
     }
     const t0 = performance.now();
-    return subscribeFrame((now) => draw(((now - t0) / 1000) % DEMO_LOOP, false));
-  }, [style, animate, fontTick]);
+    return subscribeFrame((now) => {
+      // Loop across the words' own span (not from frame 0), so no card ever
+      // flashes empty between repeats.
+      const span = DEMO.end - DEMO_FROM;
+      draw(DEMO_FROM + (((now - t0) / 1000) % span), false);
+    });
+  }, [style, animate, fontTick, textPx]);
 
   return <canvas ref={ref} aria-hidden="true" className="h-full w-full" />;
 }
@@ -502,7 +414,7 @@ function PresetPreview({ style, playing }: { style: CaptionStyle; playing: boole
 function presetBadge(style: CaptionStyle): string {
   if (style.bilingual) return "bilingual";
   if (style.speakerColors) return "speakers";
-  if (style.keywords) return "punchline";
+  if (style.emphasisTarget === "keyword") return style.layout === "stack" ? "stack" : "punchline";
   if (style.emphasis !== "none") return "spoken";
   return "block";
 }
@@ -526,78 +438,33 @@ function PresetChip({ preset, selected, onSelect }: { preset: Preset; selected: 
           : "border-zinc-200 hover:border-zinc-400 dark:border-zinc-800 dark:hover:border-zinc-600"
       }`}
     >
-      <span className="relative block h-14 overflow-hidden rounded-lg bg-zinc-900">
-        <PresetPreview style={preset.style} playing={playing} />
-        <span className="pointer-events-none absolute top-1 right-1 rounded-full bg-black/50 px-1.5 py-0.5 text-[9px] font-medium tracking-wide text-white/85">
-          {presetBadge(preset.style)}
-        </span>
+      <span className="relative block h-24 overflow-hidden rounded-lg bg-zinc-900">
+        <PresetPreview style={preset.style} playing={playing} textPx={16} />
       </span>
       <span className="px-0.5">
-        <span className="block truncate text-[11px] font-medium">{preset.name}</span>
+        <span className="flex items-baseline justify-between gap-1">
+          <span className="truncate text-[11px] font-medium">{preset.name}</span>
+          <span className="shrink-0 rounded-full bg-zinc-100 px-1.5 text-[9px] font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+            {presetBadge(preset.style)}
+          </span>
+        </span>
         <span className="line-clamp-2 text-[10px] text-zinc-400 dark:text-zinc-500">{preset.description}</span>
       </span>
     </button>
   );
 }
 
-/** A wrapping grid of single-choice buttons. */
-function Choices<T extends string>({
-  label,
-  value,
-  options,
-  onChange,
-}: {
-  label: string;
-  value: T;
-  options: { value: T; label: string }[];
-  onChange: (value: T) => void;
-}) {
+/**
+ * The large "what am I looking at" preview above the grid: the style currently
+ * in the editor, animated, at a size where the type, colour and layout actually
+ * read. It's the same renderer as the export, so what you see is what burns in.
+ */
+function FeaturedPreview({ style }: { style: CaptionStyle }) {
   return (
-    <div role="group" aria-label={label} className="grid grid-cols-3 gap-1">
-      {options.map((o) => (
-        <ChoiceButton key={o.value} selected={value === o.value} onClick={() => onChange(o.value)}>
-          {o.label}
-        </ChoiceButton>
-      ))}
+    <div className="relative h-40 overflow-hidden rounded-xl bg-zinc-900">
+      <PresetPreview style={style} playing textPx={30} />
     </div>
   );
 }
 
-function ChoiceButton({ selected, onClick, children }: { selected: boolean; onClick: () => void; children: ReactNode }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={selected}
-      className={`rounded-lg border px-2 py-1 text-xs font-medium whitespace-nowrap transition ${
-        selected
-          ? "border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900"
-          : "border-zinc-200 text-zinc-500 hover:border-zinc-400 hover:text-zinc-900 dark:border-zinc-800 dark:hover:border-zinc-600 dark:hover:text-zinc-100"
-      }`}
-    >
-      {children}
-    </button>
-  );
-}
 
-function Segmented<T extends string>({
-  label,
-  value,
-  options,
-  onChange,
-}: {
-  label: string;
-  value: T;
-  options: { value: T; label: string }[];
-  onChange: (value: T) => void;
-}) {
-  return (
-    <div role="group" aria-label={label} className="flex gap-1 [&>button]:flex-1">
-      {options.map((o) => (
-        <ChoiceButton key={o.value} selected={value === o.value} onClick={() => onChange(o.value)}>
-          {o.label}
-        </ChoiceButton>
-      ))}
-    </div>
-  );
-}

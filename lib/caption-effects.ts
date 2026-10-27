@@ -280,6 +280,21 @@ export function pickKeywords(tokens: string[]): Set<number> {
 export const KEYWORD_SCALE = 1.22;
 
 /**
+ * Punchline word indices for a caption: the stored ones from the punchline pass
+ * when they still line up with the words on screen, otherwise a local pick
+ * (numbers first, then the longest content words). A lockup breaks on the
+ * punchline, so when nothing scores we fall back to the last word to keep the
+ * two-line shape.
+ */
+export function punchlineIndices(tokens: string[], stored?: number[], locked = false): Set<number> {
+  const valid = stored?.filter((i) => Number.isInteger(i) && i >= 0 && i < tokens.length);
+  if (valid && valid.length) return new Set(valid);
+  const picked = pickKeywords(tokens);
+  if (picked.size || !locked || !tokens.length) return picked;
+  return new Set([tokens.length - 1]);
+}
+
+/**
  * Speaker index (0, 1, …) of each on-screen word. Speakers are numbered by
  * first appearance before captions are built (see `numberSpeakers`); after an
  * edit breaks the word match, the whole caption takes its first word's speaker.

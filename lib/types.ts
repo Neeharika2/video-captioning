@@ -19,6 +19,11 @@ export type Caption = {
   /** Kept for word highlighting and cheap re-grouping. */
   words: Word[];
   lines?: string[];
+  /**
+   * Indices of the caption's punchline words, from the punchline pass. Absent
+   * when no pass has run or the text was edited; both fall back to a local pick.
+   */
+  punchlineWordIndices?: number[];
   /** This cue's own position; falls back to the style's default when absent. */
   placement?: CaptionPlacement;
   /** This cue's own font scale; falls back to the style's `scale` when absent. */

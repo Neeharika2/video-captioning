@@ -20,6 +20,20 @@ import {
   type TimeRange,
 } from "@/lib/client/caption-coverage";
 import { downloadText } from "@/lib/client/save-file";
+import {
+  deleteProject as deleteStoredProject,
+  getProject,
+  getVideo,
+  listProjects,
+  newProjectId,
+  requestPersistence,
+  saveProject,
+  storageEstimate,
+  type ProjectSummary,
+  type SavedProject,
+  type StorageEstimate,
+} from "@/lib/client/project-store";
+import { captureThumbnail } from "@/lib/client/thumbnail";
 import { offsetWords, TranscribeError } from "@/lib/client/transcribe-client";
 import { clearApiKey, getApiKey, setApiKey as storeApiKey } from "@/lib/client/api-key";
 import { numberSpeakers } from "@/lib/caption-effects";
@@ -27,13 +41,15 @@ import { detectLanguage, formatLanguage } from "@/lib/detect-language";
 import { DEFAULT_GROUP_OPTIONS, groupWords, wrapLines } from "@/lib/group-words";
 import { hasNonLatinLetters, romanize } from "@/lib/romanize";
 import { latinPunctuation, parseGlossary, type SpelledWord } from "@/lib/spelling";
-import type { Word } from "@/lib/types";
+import type { Caption, Word } from "@/lib/types";
 import { DEFAULT_STYLE, normalizeStyle, type CaptionPlacement, type CaptionStyle } from "@/lib/caption-style";
 import { CaptionPlayer } from "./caption-player";
 import { ExportMenu } from "./export-menu";
 import { ApiKeyField } from "./api-key-field";
+import { ProjectsLibrary } from "./projects-library";
 import { StylePicker } from "./style-picker";
 import { Timeline } from "./timeline";
+import { ToastStack, useToasts } from "./toast";
 
 /** Phase 1 limit (PLAN.md): one ≤10 min chunk per video. */
 const MAX_SECONDS = 600;
@@ -79,6 +95,9 @@ type SpellStatus =
   | { step: "idle" }
   | { step: "running"; done: number; total: number }
   | { step: "done"; message: string; warn: boolean };
+
+/** Whether the current project is safely in this browser's database. */
+type SaveState = "idle" | "saving" | "saved" | "unsaved" | "error";
 
 function loadSettings(): Settings {
   const fallback: Settings = {
@@ -152,6 +171,37 @@ export function PipelineDebug() {
   /** Smart-spelling result per word (null = keep rule-based spelling). */
   const [spelled, setSpelled] = useState<(SpelledWord | null)[] | null>(null);
   const [spellStatus, setSpellStatus] = useState<SpellStatus>({ step: "idle" });
+  /**
+   * Punchline word indices per cue id, from the Gemini pass. Cues without an
+   * entry fall back to the local pick in the renderer.
+   */
+  const [punchlines, setPunchlines] = useState<Record<string, number[]>>({});
+  const punchlineAbortRef = useRef<AbortController | null>(null);
+  /** Skips the punchline pass once, right after a saved project is reopened. */
+  const suppressPunchlinesRef = useRef(false);
+  /** The captions the punchline pass last ran on, so it runs once per transcript. */
+  const punchlineSourceRef = useRef<Caption[] | null>(null);
+
+  // --- Projects saved in this browser -------------------------------------
+  const { toasts, push: pushToast, dismiss: dismissToast } = useToasts();
+  /** The id of the saved project being edited; null until the first save. */
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [projectsLoading, setProjectsLoading] = useState(true);
+  const [storage, setStorage] = useState<StorageEstimate | null>(null);
+  const [saveState, setSaveState] = useState<SaveState>("idle");
+  /** The project's display name (file name, or the reopened project's name). */
+  const [projectName, setProjectName] = useState("New project");
+  // Mirrors of the state the autosave writes, so an async save never reads a
+  // stale render.
+  const projectIdRef = useRef<string | null>(null);
+  const createdAtRef = useRef(0);
+  const thumbnailRef = useRef<string | null>(null);
+  const videoStoredRef = useRef(false);
+  const saveTimerRef = useRef<number | null>(null);
+  const savingRef = useRef(false);
+  /** A save asked for while another was running, replayed once it finishes. */
+  const pendingSaveRef = useRef<{ withVideo: boolean } | null>(null);
+  const persistRef = useRef<(opts: { withVideo: boolean }) => Promise<void>>(async () => {});
   const hasForeign = useMemo(() => words.some((w) => hasNonLatinLetters(w.text)), [words]);
   /**
    * Spoken language, read back from the transcript's script after transcription.
@@ -200,7 +250,9 @@ export function PipelineDebug() {
   );
   // Text and timing edits win over the derived cues; edited text is re-wrapped
   // to keep the two-line layout. Dragging clamps cues between their neighbours,
-  // so the list stays sorted for `findCaptionAt`.
+  // so the list stays sorted for `findCaptionAt`. Punchline indices from the
+  // Gemini pass ride along, but are dropped for a cue whose text was edited
+  // (the stored indices no longer describe the words on screen).
   const captions = useMemo(
     () =>
       baseCaptions.map((c) => {
@@ -209,7 +261,8 @@ export function PipelineDebug() {
         const scale = captionScales[c.id];
         const edited = captionEdits[c.id];
         const hasText = edited !== undefined && edited !== c.text;
-        if (!timing && !placement && scale === undefined && !hasText) return c;
+        const punchline = hasText ? undefined : punchlines[c.id];
+        if (!timing && !placement && scale === undefined && !hasText && !punchline) return c;
         const next = { ...c };
         if (timing) {
           next.start = timing.start;
@@ -217,13 +270,14 @@ export function PipelineDebug() {
         }
         if (placement) next.placement = placement;
         if (scale !== undefined) next.scale = scale;
-        if (edited !== undefined && edited !== c.text) {
+        if (hasText) {
           next.text = edited;
           next.lines = wrapLines(edited, DEFAULT_GROUP_OPTIONS.maxCharsPerLine, DEFAULT_GROUP_OPTIONS.maxLines);
         }
+        if (punchline) next.punchlineWordIndices = punchline;
         return next;
       }),
-    [baseCaptions, captionEdits, captionTimings, captionPlacements, captionScales],
+    [baseCaptions, captionEdits, captionTimings, captionPlacements, captionScales, punchlines],
   );
   useEffect(() => {
     try {
@@ -277,6 +331,249 @@ export function PipelineDebug() {
     if (key) storeApiKey(key);
     else clearApiKey();
   }, []);
+
+  /** Reload the library grid and the storage read-out. */
+  const refreshProjects = useCallback(async () => {
+    const [list, used] = await Promise.all([listProjects(), storageEstimate()]);
+    setProjects(list);
+    setStorage(used);
+    setProjectsLoading(false);
+  }, []);
+
+  // Load the library once on mount. The state is written after an await, so the
+  // effect never sets state synchronously.
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      const [list, used] = await Promise.all([listProjects(), storageEstimate()]);
+      if (!live) return;
+      setProjects(list);
+      setStorage(used);
+      setProjectsLoading(false);
+    })();
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  /**
+   * Write the current workspace to this browser's database. The video Blob is
+   * stored on the first save (and whenever it was missing); later saves only
+   * carry the transcript, edits and style. A refused video (quota) keeps the
+   * project and flags it "video not saved".
+   */
+  const persistProject = useCallback(
+    async ({ withVideo }: { withVideo: boolean }) => {
+      if (!file && !words.length) return;
+      if (savingRef.current) {
+        // A save is already running; remember to write again with the newer state.
+        pendingSaveRef.current = { withVideo: withVideo || Boolean(pendingSaveRef.current?.withVideo) };
+        return;
+      }
+      savingRef.current = true;
+      try {
+        // One frame per project, grabbed the first time the video is stored.
+        if (withVideo && file && !thumbnailRef.current) {
+          const shot = await captureThumbnail(file);
+          if (shot) thumbnailRef.current = shot;
+        }
+        const id = projectIdRef.current ?? newProjectId();
+        projectIdRef.current = id;
+        const project: SavedProject = {
+          id,
+          name: projectName,
+          createdAt: createdAtRef.current || Date.now(),
+          updatedAt: Date.now(),
+          bytes: file?.size ?? 0,
+          mimeType: file?.type ?? "",
+          durationSec: extract?.durationSec ?? result?.durationSec,
+          thumbnail: thumbnailRef.current ?? undefined,
+          hasVideo: videoStoredRef.current || withVideo,
+          settings: {
+            style: settings.style,
+            script: settings.script,
+            glossary: settings.glossary,
+            speakers: settings.speakers,
+          },
+          words,
+          spelled,
+          result,
+          punchlines,
+          captionEdits,
+          captionTimings,
+          captionPlacements,
+          captionScales,
+        };
+        setSaveState("saving");
+        const res = await saveProject(project, withVideo ? file : null);
+        if (!res.ok) {
+          setSaveState("error");
+          pushToast("Couldn't save this project in your browser. Storage may be full.", "error");
+          return;
+        }
+        videoStoredRef.current = res.videoStored;
+        setSaveState("saved");
+        if (withVideo && !res.videoStored) {
+          pushToast("Project saved, but the video was too big to keep — you can re-attach it when you reopen.", "info");
+        }
+        void requestPersistence();
+        void refreshProjects();
+      } finally {
+        savingRef.current = false;
+      }
+      const queued = pendingSaveRef.current;
+      if (queued) {
+        pendingSaveRef.current = null;
+        void persistRef.current(queued);
+      }
+    },
+    [
+      file,
+      projectName,
+      words,
+      spelled,
+      result,
+      punchlines,
+      captionEdits,
+      captionTimings,
+      captionPlacements,
+      captionScales,
+      settings,
+      extract,
+      pushToast,
+      refreshProjects,
+    ],
+  );
+
+  // Keep the replayed-save call pointing at the newest closure (latest state).
+  useEffect(() => {
+    persistRef.current = persistProject;
+  }, [persistProject]);
+
+  // Autosave: once captions exist, write them shortly after the user stops
+  // changing things. `persistProject` changes with every edit, so the effect
+  // re-runs (and the timer resets) on each one — a debounce, not a loop.
+  const hasCaptions = words.length > 0;
+  useEffect(() => {
+    if (!hasCaptions) return;
+    if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = window.setTimeout(() => {
+      saveTimerRef.current = null;
+      void persistProject({ withVideo: !videoStoredRef.current });
+    }, 600);
+    return () => {
+      if (saveTimerRef.current) {
+        window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+    };
+  }, [hasCaptions, persistProject]);
+
+  /** Clear the workspace back to the Projects home. */
+  const closeProject = useCallback(() => {
+    abortRef.current?.abort();
+    spellAbortRef.current?.abort();
+    punchlineAbortRef.current?.abort();
+    punchlineSourceRef.current = null;
+    suppressPunchlinesRef.current = false;
+    if (saveTimerRef.current) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    pendingSaveRef.current = null;
+    setFile(null);
+    setVideoUrl(null);
+    setAudioUrl(null);
+    setExtract(null);
+    setResult(null);
+    setWords([]);
+    setSpelled(null);
+    setSpellStatus({ step: "idle" });
+    setPunchlines({});
+    setCaptionEdits({});
+    setCaptionTimings({});
+    setCaptionPlacements({});
+    setCaptionScales({});
+    setSelectedCaptionId(null);
+    setEditingId(null);
+    setStatus({ step: "idle" });
+    setLog([]);
+    projectIdRef.current = null;
+    setProjectName("New project");
+    createdAtRef.current = 0;
+    thumbnailRef.current = null;
+    videoStoredRef.current = false;
+    setSaveState("idle");
+    void refreshProjects();
+  }, [refreshProjects]);
+
+  /** Reopen a saved project: restore the file, transcript, style and every edit. */
+  const openProject = useCallback(
+    async (id: string) => {
+      const project = await getProject(id);
+      if (!project) {
+        pushToast("That project could not be opened — it may have been deleted.", "error");
+        return;
+      }
+      const blob = project.hasVideo ? await getVideo(id) : null;
+      abortRef.current?.abort();
+      spellAbortRef.current?.abort();
+      punchlineAbortRef.current?.abort();
+      punchlineSourceRef.current = null;
+      // The restored look already has its punchline picks; don't spend a request.
+      suppressPunchlinesRef.current = true;
+
+      projectIdRef.current = id;
+      createdAtRef.current = project.createdAt;
+      thumbnailRef.current = project.thumbnail ?? null;
+      videoStoredRef.current = Boolean(blob);
+      setSaveState("saved");
+      setProjectName(project.name);
+
+      const restored = blob ? new File([blob], project.name, { type: project.mimeType || blob.type || "video/mp4" }) : null;
+      setFile(restored);
+      setVideoUrl(restored ? URL.createObjectURL(restored) : null);
+      setAudioUrl(null);
+      setExtract(null);
+      setResult(project.result);
+      setWords(project.words);
+      setSpelled(project.spelled);
+      setPunchlines(project.punchlines ?? {});
+      setCaptionEdits(project.captionEdits ?? {});
+      setCaptionTimings(project.captionTimings ?? {});
+      setCaptionPlacements(project.captionPlacements ?? {});
+      setCaptionScales(project.captionScales ?? {});
+      setSettings({
+        style: normalizeStyle(project.settings?.style, DEFAULT_STYLE),
+        script: project.settings?.script === "original" ? "original" : "roman",
+        glossary: project.settings?.glossary ?? "",
+        speakers: Boolean(project.settings?.speakers),
+      });
+      setSpellStatus({ step: "idle" });
+      setSelectedCaptionId(null);
+      setEditingId(null);
+      setLog([`Opened “${project.name}”`]);
+      setStatus(project.words.length ? { step: "done" } : { step: "idle" });
+      if (!restored) {
+        pushToast("The video wasn't saved for this project — choose the file again to preview and export.", "info");
+      }
+    },
+    [pushToast],
+  );
+
+  /** Delete a saved project (with a confirmation). */
+  const removeProject = useCallback(
+    async (id: string) => {
+      const summary = projects.find((p) => p.id === id);
+      const label = summary ? `“${summary.name}”` : "this project";
+      if (typeof window !== "undefined" && !window.confirm(`Delete ${label} from this browser? This can't be undone.`)) return;
+      await deleteStoredProject(id);
+      if (projectIdRef.current === id) closeProject();
+      else void refreshProjects();
+      pushToast("Project deleted.", "success");
+    },
+    [projects, closeProject, refreshProjects, pushToast],
+  );
 
   const runSpelling = async (source: Word[]) => {
     spellAbortRef.current?.abort();
@@ -346,11 +643,92 @@ export function PipelineDebug() {
     }
   };
 
+  /**
+   * Ask Gemini which word is the punchline in each caption (the accent the
+   * punchline presets mark). Only runs when the current look actually uses a
+   * punchline, so ordinary captions never pay for it. Results are merged into
+   * the captions below and dropped for any cue whose text was edited.
+   */
+  const runPunchlines = useCallback(
+    async (source: Caption[]) => {
+      punchlineAbortRef.current?.abort();
+      const key = getApiKey();
+      if (!key) {
+        addLog("Punchline pass skipped: add your Gemini API key in Settings.");
+        return;
+      }
+      const abort = new AbortController();
+      punchlineAbortRef.current = abort;
+      // Prefer the words (timings included); fall back to the cue text.
+      const cues = source.map((c) =>
+        c.words.length ? c.words.map((w) => w.text) : c.text.split(/\s+/).filter(Boolean),
+      );
+      const accumulated = new Array<number[] | null>(source.length).fill(null);
+      const started = Date.now();
+      try {
+        const { pickPunchlines } = await import("@/lib/client/punchline-client");
+        const summary = await pickPunchlines(cues, {
+          apiKey: key,
+          signal: abort.signal,
+          onBatch: (start, results) => results.forEach((r, k) => (accumulated[start + k] = r)),
+        });
+        if (abort.signal.aborted) return;
+        const picked: Record<string, number[]> = {};
+        source.forEach((c, i) => {
+          const p = accumulated[i];
+          if (p?.length) picked[c.id] = p;
+        });
+        setPunchlines(picked);
+        const secs = ((Date.now() - started) / 1000).toFixed(1);
+        addLog(
+          `Punchlines (${summary.model ?? "n/a"}) in ${secs} s: ${summary.accepted} cue${summary.accepted === 1 ? "" : "s"} picked, ` +
+            `${summary.rejected} answer${summary.rejected === 1 ? "" : "s"} rejected, ${summary.failed} in failed batches` +
+            (summary.lastError ? ` (${summary.lastError})` : ""),
+        );
+      } catch (err) {
+        if (abort.signal.aborted) return;
+        addLog(`Punchline pass failed: ${(err as Error).message}`);
+      }
+    },
+    [addLog],
+  );
+
+  // Run the punchline pass once per transcript, and only when a look needs it.
+  const needsPunchlines = settings.style.emphasisTarget === "keyword" || settings.style.layout !== "block";
+  useEffect(() => {
+    if (!needsPunchlines || !baseCaptions.length) return;
+    if (punchlineSourceRef.current === baseCaptions) return;
+    // A reopened project already carries its picks: adopt them without a request.
+    if (suppressPunchlinesRef.current) {
+      suppressPunchlinesRef.current = false;
+      punchlineSourceRef.current = baseCaptions;
+      return;
+    }
+    punchlineSourceRef.current = baseCaptions;
+    void runPunchlines(baseCaptions);
+  }, [needsPunchlines, baseCaptions, runPunchlines]);
+
   const pickFile = (f: File | null) => {
     abortRef.current?.abort();
     spellAbortRef.current?.abort();
+    punchlineAbortRef.current?.abort();
+    punchlineSourceRef.current = null;
+    suppressPunchlinesRef.current = false;
+    // A freshly picked file is a new, unsaved project.
+    if (saveTimerRef.current) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    pendingSaveRef.current = null;
+    projectIdRef.current = null;
+    createdAtRef.current = Date.now();
+    setProjectName(f?.name ?? "New project");
+    thumbnailRef.current = null;
+    videoStoredRef.current = false;
+    setSaveState(f ? "unsaved" : "idle");
     setSpelled(null);
     setSpellStatus({ step: "idle" });
+    setPunchlines({});
     setCaptionEdits({});
     setCaptionTimings({});
     setCaptionPlacements({});
@@ -517,6 +895,10 @@ export function PipelineDebug() {
     spellAbortRef.current?.abort();
     setSpelled(null);
     setSpellStatus({ step: "idle" });
+    punchlineAbortRef.current?.abort();
+    punchlineSourceRef.current = null;
+    suppressPunchlinesRef.current = false;
+    setPunchlines({});
     setCaptionEdits({});
     setCaptionTimings({});
     setCaptionPlacements({});
@@ -656,6 +1038,9 @@ export function PipelineDebug() {
     if (dropped) pickFile(dropped);
   };
 
+  const headerTitle = file ? file.name : projectName;
+  const workspaceOpen = Boolean(file) || words.length > 0;
+
   return (
     <div className="flex min-h-dvh flex-col bg-zinc-50 lg:h-dvh dark:bg-zinc-950">
       <input
@@ -669,7 +1054,12 @@ export function PipelineDebug() {
 
       {/* Toolbar */}
       <header className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-950">
-        <div className="flex min-w-0 items-center gap-3">
+        <button
+          type="button"
+          onClick={closeProject}
+          className="flex min-w-0 items-center gap-3 text-left"
+          title="All projects"
+        >
           <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900">
             <svg viewBox="0 0 24 24" fill="none" className="h-4 w-4" aria-hidden="true">
               <rect x="3" y="5" width="18" height="14" rx="2" stroke="currentColor" strokeWidth="1.75" />
@@ -677,14 +1067,24 @@ export function PipelineDebug() {
             </svg>
           </span>
           <div className="min-w-0">
-            <p className="truncate text-sm leading-tight font-semibold">{file ? file.name : "New project"}</p>
+            <p className="truncate text-sm leading-tight font-semibold">{headerTitle}</p>
             <p className="truncate text-xs text-zinc-500">
               {file ? `${mb(file.size)} · your video never leaves your device` : "Add captions to any video"}
             </p>
           </div>
-        </div>
+        </button>
 
         <div className="ml-auto flex items-center gap-2">
+          {saveState !== "idle" && <SaveChip state={saveState} />}
+          {workspaceOpen && (
+            <button
+              type="button"
+              onClick={closeProject}
+              className="rounded-full px-3 py-2 text-sm text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-900 dark:hover:text-zinc-100"
+            >
+              Projects
+            </button>
+          )}
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
@@ -697,7 +1097,8 @@ export function PipelineDebug() {
         </div>
       </header>
 
-      {/* Workspace */}
+      {workspaceOpen ? (
+      /* Workspace */
       <div className="grid flex-1 grid-cols-1 lg:min-h-0 lg:grid-cols-[300px_minmax(0,1fr)_340px]">
         {/* Captions */}
         <aside className="order-2 flex min-h-0 flex-col gap-3 overflow-y-auto border-t border-zinc-200 p-4 lg:order-1 lg:border-t-0 lg:border-r dark:border-zinc-800">
@@ -872,7 +1273,14 @@ export function PipelineDebug() {
               />
             </>
           ) : (
-            <DropZone dragOver={dragOver} onDragOver={setDragOver} onDrop={onDrop} onPick={() => fileInputRef.current?.click()} />
+            <DropZone
+              dragOver={dragOver}
+              onDragOver={setDragOver}
+              onDrop={onDrop}
+              onPick={() => fileInputRef.current?.click()}
+              title="Video not saved for this project"
+              subtitle="Choose the video file again to preview it and export captions."
+            />
           )}
         </main>
 
@@ -1004,6 +1412,42 @@ export function PipelineDebug() {
           </div>
         </aside>
       </div>
+      ) : (
+        <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-10 px-6 py-10">
+          <section className="flex flex-col gap-5">
+            <div className="flex flex-col items-start gap-3">
+              <span className="rounded-full border border-zinc-200 px-3 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
+                Local-first · your video never leaves your device
+              </span>
+              <h1 className="text-3xl font-semibold tracking-tight text-balance sm:text-4xl">
+                Captions for any video
+              </h1>
+              <p className="max-w-2xl text-zinc-600 dark:text-zinc-400">
+                Drop in a clip and get accurately transcribed, time-coded captions you can style in seconds. Download
+                them as <code className="rounded bg-zinc-100 px-1.5 py-0.5 text-sm dark:bg-zinc-900">.srt</code> or{" "}
+                <code className="rounded bg-zinc-100 px-1.5 py-0.5 text-sm dark:bg-zinc-900">.vtt</code>, or burn them
+                straight into an MP4. Past projects are saved in this browser, ready to reopen.
+              </p>
+            </div>
+            <DropZone
+              dragOver={dragOver}
+              onDragOver={setDragOver}
+              onDrop={onDrop}
+              onPick={() => fileInputRef.current?.click()}
+            />
+          </section>
+
+          <ProjectsLibrary
+            projects={projects}
+            loading={projectsLoading}
+            storage={storage}
+            onOpen={openProject}
+            onDelete={removeProject}
+          />
+        </main>
+      )}
+
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </div>
   );
 }
@@ -1013,11 +1457,16 @@ function DropZone({
   onDragOver,
   onDrop,
   onPick,
+  title = "Drop a video here, or click to choose",
+  subtitle = "MP4, MOV, MKV, WebM, AVI — up to 10 minutes",
 }: {
   dragOver: boolean;
   onDragOver: (over: boolean) => void;
   onDrop: (e: DragEvent) => void;
   onPick: () => void;
+  /** Headline; the workspace reuses the zone when a project's video wasn't saved. */
+  title?: string;
+  subtitle?: string;
 }) {
   return (
     <button
@@ -1046,8 +1495,8 @@ function DropZone({
           />
         </svg>
       </span>
-      <span className="text-lg font-medium">Drop a video here, or click to choose</span>
-      <span className="text-sm text-zinc-500">MP4, MOV, MKV, WebM, AVI — up to 10 minutes</span>
+      <span className="text-lg font-medium">{title}</span>
+      <span className="text-sm text-zinc-500">{subtitle}</span>
     </button>
   );
 }
@@ -1078,6 +1527,24 @@ function TabButton({
     >
       {children}
     </button>
+  );
+}
+
+/** Where the current project stands: saved in this browser, still saving, or not yet. */
+function SaveChip({ state }: { state: SaveState }) {
+  const label =
+    state === "saving" ? "Saving…" : state === "saved" ? "Saved" : state === "error" ? "Not saved" : state === "unsaved" ? "Unsaved" : "";
+  if (!label) return null;
+  const tone =
+    state === "error"
+      ? "text-red-600 dark:text-red-400"
+      : state === "saved"
+        ? "text-emerald-600 dark:text-emerald-400"
+        : "text-zinc-400";
+  return (
+    <span className={`text-xs tabular-nums ${tone}`} data-testid="save-state" title="Saved in this browser only">
+      {label}
+    </span>
   );
 }
 
