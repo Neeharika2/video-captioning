@@ -285,6 +285,10 @@ type ColourRole = "textColor" | "highlightColor";
 /** Roughly the panel's rendered height, used only to pick a direction for it. */
 const PANEL_HEIGHT = 170;
 
+/** Roughly how big Chrome's own colour popup is, used to keep it on screen. */
+const PICKER_W = 300;
+const PICKER_H = 300;
+
 /**
  * The two caption colours, behind one panel. We draw the panel ourselves instead
  * of leaning on `<input type="color">` for the swatch grid: Chrome places the
@@ -308,6 +312,37 @@ function ColourPicker({
   const [openUp, setOpenUp] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const customRef = useRef<HTMLInputElement>(null);
+  const customButtonRef = useRef<HTMLButtonElement>(null);
+
+  /**
+   * Open the browser's colour picker. Chrome anchors that popup to the input
+   * and won't let us move it afterwards, so we shift the (invisible) input just
+   * far left — and, when there's no room beneath, just far up — that the popup
+   * lands fully inside the window while staying beside the swatch.
+   */
+  const openCustomPicker = () => {
+    const input = customRef.current;
+    const trigger = customButtonRef.current;
+    if (!input) return;
+    if (trigger) {
+      const rect = trigger.getBoundingClientRect();
+      const left = Math.max(8, Math.min(rect.right - PICKER_W, window.innerWidth - PICKER_W - 8));
+      const top =
+        rect.bottom + 4 + PICKER_H <= window.innerHeight - 8
+          ? rect.bottom + 4
+          : Math.max(8, rect.top - 4 - PICKER_H);
+      input.style.left = `${left}px`;
+      input.style.top = `${top}px`;
+      // Force layout so the picker anchors to the nudged spot.
+      void input.getBoundingClientRect();
+    }
+    try {
+      if (typeof input.showPicker === "function") input.showPicker();
+      else input.click();
+    } catch {
+      input.click();
+    }
+  };
 
   const toggle = (role: ColourRole) => {
     if (openFor === role) {
@@ -417,18 +452,10 @@ function ColourPicker({
               />
             </label>
             <button
+              ref={customButtonRef}
               type="button"
               aria-label="Custom colour"
-              onClick={() => {
-                const input = customRef.current;
-                if (!input) return;
-                try {
-                  if (typeof input.showPicker === "function") input.showPicker();
-                  else input.click();
-                } catch {
-                  input.click();
-                }
-              }}
+              onClick={openCustomPicker}
               className="flex shrink-0 items-center gap-1.5 rounded-lg border border-zinc-200 px-2 py-1.5 text-xs text-zinc-500 transition hover:border-zinc-400 dark:border-zinc-700 dark:text-zinc-400 dark:hover:border-zinc-500"
             >
               Custom
@@ -441,10 +468,10 @@ function ColourPicker({
           </div>
 
           {/* The browser's own colour picker, kept as the "Custom" option. It
-              draws its popup itself and we can't reposition it once open, so the
-              input it hangs off is parked in the window's top-left corner — the
-              one place the popup always fits — rather than beside the rail,
-              where it used to slide off the right edge of a narrow window. */}
+              draws its popup itself and can't be repositioned once open, so the
+              input it hangs off is nudged to sit just left of the swatch before
+              opening — enough room for the popup, but still beside the control
+              where you'd expect it. */}
           <input
             ref={customRef}
             type="color"
@@ -452,7 +479,7 @@ function ColourPicker({
             tabIndex={-1}
             value={toHex(value) ?? "#000000"}
             onChange={(e) => setValue(e.target.value)}
-            className="pointer-events-none fixed top-2 left-2 h-7 w-7 opacity-0"
+            className="pointer-events-none fixed top-0 left-0 h-7 w-7 opacity-0"
           />
         </div>
       )}
