@@ -258,6 +258,24 @@ function toHex(input: string): string | null {
   return null;
 }
 
+/** Split a colour into red, green and blue 0-255 channels. */
+function rgbChannels(hex: string): [number, number, number] {
+  const norm = toHex(hex);
+  if (!norm) return [0, 0, 0];
+  return [1, 3, 5].map((i) => parseInt(norm.slice(i, i + 2), 16)) as [number, number, number];
+}
+
+function toRgbHex([r, g, b]: [number, number, number]): string {
+  return `#${[r, g, b].map((n) => Math.round(n).toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** Channel sliders, each tinted with the primary it drives. */
+const CHANNELS = [
+  { label: "R", accent: "#ef4444" },
+  { label: "G", accent: "#22c55e" },
+  { label: "B", accent: "#3b82f6" },
+] as const;
+
 /** The colours offered as one-tap swatches, in warm-to-cool order. */
 const QUICK_COLOURS = [
   "#ffffff",
@@ -283,7 +301,7 @@ const QUICK_COLOURS = [
 type ColourRole = "textColor" | "highlightColor";
 
 /** Roughly the panel's rendered height, used only to pick a direction for it. */
-const PANEL_HEIGHT = 160;
+const PANEL_HEIGHT = 220;
 
 /**
  * The two caption colours, behind one popover. We draw our own panel instead of
@@ -335,6 +353,7 @@ function ColourPicker({
   }, [openFor]);
 
   const value = openFor === "highlightColor" ? highlightColor : textColor;
+  const rgb = rgbChannels(value);
   const setValue = (next: string) => {
     if (openFor) onChange({ [openFor]: next } as Partial<CaptionStyle>);
   };
@@ -392,39 +411,53 @@ function ColourPicker({
             ))}
           </div>
 
-          <div className="flex items-center gap-2">
-            <label className="flex flex-1 items-center gap-1 rounded-lg border border-zinc-200 px-2 py-1.5 focus-within:border-zinc-400 dark:border-zinc-700 dark:focus-within:border-zinc-500">
-              <span className="text-xs text-zinc-400">#</span>
-              <input
-                // Remount when the value changes from a swatch or the native
-                // picker, so the field shows the new colour without an effect.
-                key={value}
-                type="text"
-                aria-label="Hex colour"
-                defaultValue={value.replace(/^#/, "")}
-                spellCheck={false}
-                maxLength={7}
-                onChange={(e) => {
-                  const hex = toHex(e.target.value);
-                  if (hex) setValue(hex);
-                }}
-                onBlur={(e) => {
-                  // Put the typed text back if it never became a valid colour.
-                  if (!toHex(e.target.value)) e.target.value = value.replace(/^#/, "");
-                }}
-                className="w-full bg-transparent text-xs text-zinc-900 outline-none dark:text-zinc-100"
-              />
-            </label>
-            <label className="flex shrink-0 items-center gap-1.5 rounded-lg border border-zinc-200 px-2 py-1.5 text-xs text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
-              Custom
-              <input
-                type="color"
-                aria-label="Custom colour"
-                value={toHex(value) ?? "#000000"}
-                onChange={(e) => setValue(e.target.value)}
-                className="h-5 w-6 cursor-pointer rounded border-0 bg-transparent p-0"
-              />
-            </label>
+          <label className="flex items-center gap-1 rounded-lg border border-zinc-200 px-2 py-1.5 focus-within:border-zinc-400 dark:border-zinc-700 dark:focus-within:border-zinc-500">
+            <span className="text-xs text-zinc-400">#</span>
+            <input
+              // Remount when the value changes from a swatch, a slider or the
+              // hex field itself, so the field shows the colour without an effect.
+              key={value}
+              type="text"
+              aria-label="Hex colour"
+              defaultValue={value.replace(/^#/, "")}
+              spellCheck={false}
+              maxLength={7}
+              onChange={(e) => {
+                const hex = toHex(e.target.value);
+                if (hex) setValue(hex);
+              }}
+              onBlur={(e) => {
+                // Put the typed text back if it never became a valid colour.
+                if (!toHex(e.target.value)) e.target.value = value.replace(/^#/, "");
+              }}
+              className="w-full bg-transparent text-xs text-zinc-900 outline-none dark:text-zinc-100"
+            />
+          </label>
+
+          {/* Our own mixer rather than `<input type="color">`: the native popup
+              is placed by the browser and can open off screen, which is the
+              whole reason this panel exists. */}
+          <div className="flex flex-col gap-1.5">
+            {CHANNELS.map(({ label, accent }, index) => (
+              <div key={label} className="flex items-center gap-2">
+                <span className="w-3 text-[10px] font-medium text-zinc-400">{label}</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={255}
+                  value={rgb[index]}
+                  aria-label={`${label} channel`}
+                  onChange={(e) => {
+                    const next = [...rgb] as [number, number, number];
+                    next[index] = Number(e.target.value);
+                    setValue(toRgbHex(next));
+                  }}
+                  className="h-1.5 flex-1 cursor-pointer"
+                  style={{ accentColor: accent }}
+                />
+                <span className="w-6 text-right text-[10px] tabular-nums text-zinc-400">{rgb[index]}</span>
+              </div>
+            ))}
           </div>
         </div>
       )}
